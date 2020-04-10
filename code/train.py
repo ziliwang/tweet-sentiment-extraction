@@ -14,9 +14,9 @@ from tqdm import tqdm
 from copy import deepcopy
 
 MAX_LEN = 200
-cls_token_id = 101
-pad_token_id = 0
-sep_token_id = 102
+cls_token_id = 0
+pad_token_id = 1
+sep_token_id = 2
 
 
 def collect_func(records):
@@ -123,7 +123,7 @@ def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_datait
 class BertForQuestionAnswering(BertPreTrainedModel):
     def __init__(self, config):
         super(BertForQuestionAnswering, self).__init__(config)
-        self.bert = BertModel(config)
+        self.bert = RobertaModel(config)
         self.logits = nn.Linear(config.hidden_size, 2)
         self.dropout = nn.Dropout(0.2)
         self.init_weights()
@@ -157,8 +157,8 @@ class BertForQuestionAnswering(BertPreTrainedModel):
 
 
 @click.command()
-@click.option('--data', default='bert.input.joblib')
-@click.option('--pretrained', default='../model/bert-l12')
+@click.option('--data', default='cased_roberta.input.joblib')
+@click.option('--pretrained', default='../model/roberta-l12/')
 @click.option('--lr', default=3e-5)
 @click.option('--batch-size', default=32)
 @click.option('--epoch', default=5)
@@ -177,9 +177,6 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
         val = [data[i] for i in val_idx]
         model = BertForQuestionAnswering.from_pretrained(pretrained, num_labels=2).cuda()
         no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
-        model_layer_names = ['bert.embeddings']
-        model_layer_names += ['bert.encoder.layer.{}.'.format(i) for i in range(model.config.num_hidden_layers)]
-        model_layer_names += ['qa_outputs']
         optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
                             "lr": lr, 'weight_decay': 1e-3},
                            {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
