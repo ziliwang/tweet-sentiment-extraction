@@ -47,18 +47,20 @@ def seed_everything(seed: int):
 
 def train_epoch(model, optimizer, lr_scheduler, dataiter, accumulate_step):
     model.train()
-    step = 0
+    sample_num = 0
     cum_loss = 0
+    step = 0
     for inputs, starts, ends, _, _, _ in tqdm(dataiter):
         step += 1
-        loss = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long(), start_positions=starts, end_positions=ends)[0]
-        cum_loss += loss.detach().cpu().data.numpy()
-        loss.backward()
+        sample_num += inputs.shape[0]
+        loss = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long(), start_positions=starts, end_positions=ends)
+        cum_loss += loss.sum().detach().cpu().data.numpy()
+        loss.mean().backward()
         if step % accumulate_step == 0:
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-    return cum_loss/step
+    return cum_loss/sample_num
 
 
 def jaccard(str1, str2):
@@ -73,7 +75,7 @@ def validate_epoch(model, dataiter):
     score = 0
     sample_counts = 0
     for inputs, _, _, offsets, texts, gts in dataiter:
-        start_logits, end_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())[:2]
+        start_logits, end_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
         _, start_top5 = torch.topk(start_logits, 20)
         _, end_top5 = torch.topk(end_logits, 20)
         batch_size = inputs.shape[0]
@@ -103,6 +105,45 @@ def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_datait
         print(f'epoch {e} loss {loss:.6f} score: {score:.6f}')
 
 
+class BertForQuestionAnswering(BertPreTrainedModel):
+    def __init__(self, config):
+        super(BertForQuestionAnswering, self).__init__(config)
+        self.bert = BertModel(config)
+        self.logits = nn.Linear(config.hidden_size, 2)
+        self.dropout = nn.Dropout(0.2)
+        self.avgpool = nn.AvgPool1d(3, stride=1, padding=1)
+        self.init_weights()
+
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None,
+                start_positions=None, end_positions=None):
+        outputs = self.bert(input_ids,
+                            attention_mask=attention_mask,
+                            token_type_ids=token_type_ids,
+                            position_ids=position_ids,
+                            head_mask=head_mask)
+
+        hidden_states = outputs[0]
+        start_end_logits = self.logits(self.dropout(hidden_states))
+        start_logits, end_logits = start_end_logits.split(1, dim=-1)
+
+        if start_positions is not None and end_positions is not None:
+            for x in (start_positions, end_positions):
+                if x.dim() > 1:
+                    x.squeeze_(-1)
+            start_logits = self.avgpool(start_logits)
+            end_logits = self.avgpool(end_logits)
+            start_loss = F.cross_entropy(start_logits.squeeze(-1), start_positions, reduction='none')
+            end_loss = F.cross_entropy(end_logits.squeeze(-1), end_positions, reduction='none')
+            return start_loss + end_loss
+
+        if not self.training:
+            p_mask = attention_mask.float()  # 1 for available 0 for unavailable
+            p_mask[:, :2] = 0.0
+            start_logits = start_logits.squeeze(-1) * p_mask - 1e30 * (1 - p_mask)
+            end_logits = end_logits.squeeze(-1) * p_mask - 1e30 * (1- p_mask)
+            return start_logits, end_logits
+
+
 @click.command()
 @click.option('--data', default='bert.input.joblib')
 @click.option('--pretrained', default='../model/bert-l12')
@@ -117,6 +158,9 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
     train, val = train_test_split(data, test_size=0.2, random_state=seed)
     model = BertForQuestionAnswering.from_pretrained(pretrained, num_labels=2).cuda()
     no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
+    model_layer_names = ['bert.embeddings']
+    model_layer_names += ['bert.encoder.layer.{}.'.format(i) for i in range(model.config.num_hidden_layers)]
+    model_layer_names += ['qa_outputs']
     optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
                         "lr": lr, 'weight_decay': 1e-3},
                        {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
