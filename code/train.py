@@ -120,24 +120,22 @@ def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_datait
     return best_score, best_model
 
 
-class BertForQuestionAnswering(BertPreTrainedModel):
+class RobertaForQuestionAnswering(BertPreTrainedModel):
     def __init__(self, config):
-        super(BertForQuestionAnswering, self).__init__(config)
-        self.bert = RobertaModel(config)
-        self.logits = nn.Linear(config.hidden_size, 2)
+        super(RobertaForQuestionAnswering, self).__init__(config)
+        self.roberta = RobertaModel(config)
+        self.logits = nn.Linear(config.hidden_size*2, 2)
+        self.bn = nn.BatchNorm1d(config.hidden_size)
         self.dropout = nn.Dropout(0.2)
-        self.init_weights()
+        # self.init_weights()
+        torch.nn.init.normal_(self.logits.weight, std=0.02)
 
-    def forward(self, input_ids, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None,
-                start_positions=None, end_positions=None):
-        outputs = self.bert(input_ids,
-                            attention_mask=attention_mask,
-                            token_type_ids=token_type_ids,
-                            position_ids=position_ids,
-                            head_mask=head_mask)
-
+    def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
+        outputs = self.roberta(input_ids, attention_mask=attention_mask)
         hidden_states = outputs[0]
-        start_end_logits = self.logits(self.dropout(hidden_states))
+        pooling_out = outputs[1][:,None,:].expand_as(hidden_states)
+        # start_end_logits = self.logits(self.dropout(self.bn(hidden_states.reshape(-1, hidden_states.shape[-1])).reshape_as(hidden_states)))
+        start_end_logits = self.logits(self.dropout(torch.cat([hidden_states, pooling_out], dim=-1)))
         start_logits, end_logits = start_end_logits.split(1, dim=-1)
 
         if start_positions is not None and end_positions is not None:
@@ -175,10 +173,10 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
         print(f'---- {k} Fold ---')
         train = [data[i] for i in train_idx]
         val = [data[i] for i in val_idx]
-        model = BertForQuestionAnswering.from_pretrained(pretrained, num_labels=2).cuda()
+        model = RobertaForQuestionAnswering.from_pretrained(pretrained).cuda()
         no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
         optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-                            "lr": lr, 'weight_decay': 1e-3},
+                            "lr": lr, 'weight_decay': 1e-2},
                            {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
                             "lr": lr, 'weight_decay': 0}])
         train_steps = np.ceil(len(train) / batch_size / accumulate_step * epoch)
