@@ -125,17 +125,17 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
         super(RobertaForQuestionAnswering, self).__init__(config)
         self.roberta = RobertaModel(config)
         self.logits = nn.Linear(config.hidden_size*2, 2)
-        self.bn = nn.BatchNorm1d(config.hidden_size)
-        self.dropout = nn.Dropout(0.2)
-        # self.init_weights()
-        torch.nn.init.normal_(self.logits.weight, std=0.02)
+        self.bn = nn.BatchNorm1d(config.hidden_size*2)
+        self.dropout = nn.Dropout(0.5)
+        self.init_weights()
+        # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
     def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
         outputs = self.roberta(input_ids, attention_mask=attention_mask)
-        hidden_states = outputs[0]
-        pooling_out = outputs[1][:,None,:].expand_as(hidden_states)
+        hidden_states = torch.cat([outputs[0], outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
+        # hidden_states = outputs[0]
         # start_end_logits = self.logits(self.dropout(self.bn(hidden_states.reshape(-1, hidden_states.shape[-1])).reshape_as(hidden_states)))
-        start_end_logits = self.logits(self.dropout(torch.cat([hidden_states, pooling_out], dim=-1)))
+        start_end_logits = self.logits(self.dropout(hidden_states))
         start_logits, end_logits = start_end_logits.split(1, dim=-1)
 
         if start_positions is not None and end_positions is not None:
