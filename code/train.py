@@ -125,7 +125,6 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
         super(RobertaForQuestionAnswering, self).__init__(config)
         self.roberta = RobertaModel(config)
         self.logits = nn.Linear(config.hidden_size*2, 2)
-        self.bn = nn.BatchNorm1d(config.hidden_size*2)
         self.dropout = nn.Dropout(0.5)
         self.init_weights()
         # torch.nn.init.normal_(self.logits.weight, std=0.02)
@@ -159,7 +158,7 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
 @click.option('--pretrained', default='../model/roberta-l12/')
 @click.option('--lr', default=3e-5)
 @click.option('--batch-size', default=32)
-@click.option('--epoch', default=5)
+@click.option('--epoch', default=3)
 @click.option('--accumulate-step', default=1)
 @click.option('--seed', default=9895)
 def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
