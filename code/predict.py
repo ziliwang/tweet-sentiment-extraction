@@ -12,27 +12,29 @@ import numpy as np
 import os
 from tqdm import tqdm
 from copy import deepcopy
-from tokenizers import BertWordPieceTokenizer
+from tokenizers import ByteLevelBPETokenizer
 import pandas as pd
 
 
 MAX_LEN = 200
-cls_token_id = 101
-pad_token_id = 0
-sep_token_id = 102
+cls_token_id = 0
+pad_token_id = 1
+sep_token_id = 2
 
 
 def preprocess(tokenizer, df):
     output = []
-    sentiment_hash = dict((v, tokenizer.token_to_id(v)) for v in ('positive', 'negative', 'neutral'))
+    sentiment_hash = dict((v[1:], tokenizer.token_to_id(v)) for v in ('Ġpositive', 'Ġnegative', 'Ġneutral'))
     for line, row in df.iterrows():
         if pd.isna(row.text): continue
+        text = row.text
+        if not text.startswith(' '): text = ' ' + text
         record = {}
-        encoding = tokenizer.encode(row.text)
-        record['tokens_id'] = encoding.ids[1:-1]
+        encoding = tokenizer.encode(text)
+        record['tokens_id'] = encoding.ids
         record['sentiment'] = sentiment_hash[row.sentiment]
-        record['offsets'] = encoding.offsets[1:-1]
-        record['text'] = row.text
+        record['offsets'] = encoding.offsets
+        record['text'] = text
         record['id'] = row.textID
         output.append(record)
     return output
@@ -51,24 +53,18 @@ def collect_func(records):
     return ids, pad_sequence(inputs, batch_first=True, padding_value=pad_token_id).cuda(), offsets, texts
 
 
-class BertForQuestionAnswering(BertPreTrainedModel):
+class RobertaForQuestionAnswering(BertPreTrainedModel):
     def __init__(self, config):
-        super(BertForQuestionAnswering, self).__init__(config)
-        self.bert = BertModel(config)
-        self.logits = nn.Linear(config.hidden_size, 2)
-        self.dropout = nn.Dropout(0.2)
-        self.avgpool = nn.AvgPool1d(3, stride=1, padding=1)
+        super(RobertaForQuestionAnswering, self).__init__(config)
+        self.roberta = RobertaModel(config)
+        self.logits = nn.Linear(config.hidden_size*2, 2)
+        self.bn = nn.BatchNorm1d(config.hidden_size*2)
+        self.dropout = nn.Dropout(0.5)
         self.init_weights()
 
-    def forward(self, input_ids, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None,
-                start_positions=None, end_positions=None):
-        outputs = self.bert(input_ids,
-                            attention_mask=attention_mask,
-                            token_type_ids=token_type_ids,
-                            position_ids=position_ids,
-                            head_mask=head_mask)
-
-        hidden_states = outputs[0]
+    def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
+        outputs = self.roberta(input_ids, attention_mask=attention_mask)
+        hidden_states = torch.cat([outputs[0], outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
         start_end_logits = self.logits(self.dropout(hidden_states))
         start_logits, end_logits = start_end_logits.split(1, dim=-1)
 
@@ -76,8 +72,6 @@ class BertForQuestionAnswering(BertPreTrainedModel):
             for x in (start_positions, end_positions):
                 if x.dim() > 1:
                     x.squeeze_(-1)
-            # start_logits = self.avgpool(torch.cat(start_logits))
-            # end_logits = self.avgpool(torch.cat(end_logits))
             start_loss = F.cross_entropy(start_logits.squeeze(-1), start_positions, reduction='none')
             end_loss = F.cross_entropy(end_logits.squeeze(-1), end_positions, reduction='none')
             return start_loss + end_loss
@@ -108,16 +102,17 @@ def pridect_epoch(model, dataiter, starts_logits_5cv, ends_logits_5cv):
 
 @click.command()
 @click.option('--test-path', default='../input/test.csv')
-@click.option('--vocab', default='../model/bert-l12/vocab.txt')
+@click.option('--vocab', default='../model/roberta-l12/vocab.json')
+@click.option('--merges', default='../model/roberta-l12/merges.txt')
 @click.option('--models', default='trained.models')
-@click.option('--config', default='../model/bert-l12/config.json')
-def main(test_path, vocab, models, config):
-    tokenizer = BertWordPieceTokenizer(vocab)
+@click.option('--config', default='../model/roberta-l12/config.json')
+def main(test_path, vocab, merges, models, config):
+    tokenizer = ByteLevelBPETokenizer(vocab, merges, lowercase=True, add_prefix_space=True)
     test_df = pd.read_csv(test_path)
     test = preprocess(tokenizer, test_df)
     model_config = BertConfig.from_json_file(config)
     saved_models = torch.load(models)
-    model = BertForQuestionAnswering(model_config).cuda()
+    model = RobertaForQuestionAnswering(model_config).cuda()
     testiter = DataLoader(test, batch_size=32, shuffle=False, collate_fn=collect_func)
     print(f"5cv {saved_models['score']}")
     starts_logits_5cv = {}

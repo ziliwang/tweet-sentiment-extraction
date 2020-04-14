@@ -29,10 +29,6 @@ def annotate1(tokenizer, text, selected_text):
     s_i = b[0]
     e_i = b[-1]
     decode = text[offsets[s_i][0]:offsets[e_i][1]]
-    if set(decode.lower().split()) != set(selected_text.lower().split()):
-        print(f'o:{text}\ns:{selected_text}\na:{decode}')
-        print(tokens)
-        print(offsets)
     return {'text': text, 'offsets': offsets, 'tokens_id': encoding.ids, 'start': s_i, 'end': e_i, 'gt': selected_text}
 
 
@@ -49,7 +45,7 @@ def annotate(tokenizer, text, selected_text):
     #         idx0 = ind
     #         idx1 = ind + len_st - 1
     #         break
-    if text.startswith(' '):
+    if not text.startswith(' '):
         text = ' ' + text
     start = text.find(selected_text)
     assert start != -1
@@ -75,10 +71,10 @@ def annotate(tokenizer, text, selected_text):
     # s_i = b[0]
     # e_i = b[-1]
     decode = text[offsets[s_i][0]:offsets[e_i][1]]
-    if set(decode.lower().split()) != set(selected_text.lower().split()):
-        print(f'o:{text}\ns:{selected_text}\na:{decode}')
-        print(tokens)
-        print(offsets)
+    # if set(decode.lower().split()) != set(selected_text.lower().split()):
+    #     print(f'o:{text}\ns:{selected_text}\na:{decode}')
+    #     print(tokens)
+    #     print(offsets)
     return {'text': text, 'offsets': offsets, 'tokens_id': encoding.ids, 'start': s_i, 'end': e_i, 'gt': selected_text}
 
 
