@@ -1,7 +1,7 @@
 import torch
 from torch import nn, optim
 from torch.nn import functional as F
-from transformers import *
+from transformers import AlbertTokenizer, AlbertModel, AdamW, BertPreTrainedModel, get_linear_schedule_with_warmup
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from sklearn.model_selection import train_test_split, KFold
@@ -14,9 +14,9 @@ from tqdm import tqdm
 from copy import deepcopy
 
 MAX_LEN = 200
-cls_token_id = 0
-pad_token_id = 1
-sep_token_id = 2
+cls_token_id = 2
+pad_token_id = 0
+sep_token_id = 3
 
 
 def collect_func(records):
@@ -78,23 +78,24 @@ def validate_epoch(model, dataiter):
     with torch.no_grad():
         for inputs, _, _, offsets, texts, gts in dataiter:
             start_logits, end_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
-            _, start_top5 = torch.topk(start_logits, 20)
-            _, end_top5 = torch.topk(end_logits, 20)
+            _, start_index = torch.topk(start_logits, 20)
+            _, end_index = torch.topk(end_logits, 20)
             batch_size = inputs.shape[0]
             sample_counts += batch_size
             for i in range(batch_size):
                 start = None
-                for i_s in start_top5[i]:
+                for i_s in start_index[i]:
                     if i_s > 1 and i_s < len(offsets[i])+2:
                         start = i_s
                         break
                 end = None
-                for i_e in end_top5[i]:
-                    if i_e >= i_s and i_e < len(offsets[i])+2:
+                for i_e in end_index[i]:
+                    if i_e >= start and i_e < len(offsets[i])+2:
                         end = i_e
                         break
                 assert start is not None
-                assert end is not None
+                if end is None:
+                    end = start
                 predict = texts[i][offsets[i][start-2][0]: offsets[i][end-2][1]]
                 score += jaccard(gts[i], predict)
     return score/sample_counts
@@ -120,18 +121,17 @@ def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_datait
     return best_score, best_model
 
 
-class RobertaForQuestionAnswering(BertPreTrainedModel):
+class AlbertForQuestionAnswering(BertPreTrainedModel):
     def __init__(self, config):
-        super(RobertaForQuestionAnswering, self).__init__(config)
-        self.roberta = RobertaModel(config)
+        super(AlbertForQuestionAnswering, self).__init__(config)
+        self.albert = AlbertModel(config)
         self.logits = nn.Linear(config.hidden_size*2, 2)
-        self.bn = nn.BatchNorm1d(config.hidden_size*2)
-        self.dropout = nn.Dropout(0.5)
+        self.dropout = nn.Dropout(0.2)
         self.init_weights()
         # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
     def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
-        outputs = self.roberta(input_ids, attention_mask=attention_mask)
+        outputs = self.albert(input_ids, attention_mask=attention_mask)
         hidden_states = torch.cat([outputs[0], outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
         # hidden_states = outputs[0]
         # start_end_logits = self.logits(self.dropout(self.bn(hidden_states.reshape(-1, hidden_states.shape[-1])).reshape_as(hidden_states)))
@@ -155,8 +155,8 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
 
 
 @click.command()
-@click.option('--data', default='cased_roberta.input.joblib')
-@click.option('--pretrained', default='../model/roberta-l12/')
+@click.option('--data', default='albert.input.joblib')
+@click.option('--pretrained', default='../model/albert.base/')
 @click.option('--lr', default=3e-5)
 @click.option('--batch-size', default=32)
 @click.option('--epoch', default=5)
@@ -173,10 +173,10 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
         print(f'---- {k} Fold ---')
         train = [data[i] for i in train_idx]
         val = [data[i] for i in val_idx]
-        model = RobertaForQuestionAnswering.from_pretrained(pretrained).cuda()
-        no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        model = AlbertForQuestionAnswering.from_pretrained(pretrained).cuda()
+        no_decay = ['.bias', 'full_layer_layer_norm.weight', 'LayerNorm.weight', ]
         optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-                            "lr": lr, 'weight_decay': 1e-2},
+                            "lr": lr, 'weight_decay': 1e-3},
                            {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
                             "lr": lr, 'weight_decay': 0}])
         train_steps = np.ceil(len(train) / batch_size / accumulate_step * epoch)
