@@ -4,7 +4,6 @@ from torch.nn import functional as F
 from transformers import *
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
-from sklearn.model_selection import train_test_split, KFold
 import joblib
 import click
 import random
@@ -14,26 +13,29 @@ from tqdm import tqdm
 from copy import deepcopy
 from tokenizers import ByteLevelBPETokenizer
 import pandas as pd
+from itertools import accumulate
 
 
 MAX_LEN = 200
-cls_token_id = 0
-pad_token_id = 1
-sep_token_id = 2
+cls_token_id = 2
+pad_token_id = 0
+sep_token_id = 3
 
 
 def preprocess(tokenizer, df):
     output = []
-    sentiment_hash = dict((v[1:], tokenizer.token_to_id(v)) for v in ('Ġpositive', 'Ġnegative', 'Ġneutral'))
+    sentiment_hash = dict(zip(['positive', 'negative', 'neutral'], tokenizer.convert_tokens_to_ids(['▁positive', '▁negative', '▁neutral'])))
     for line, row in df.iterrows():
         if pd.isna(row.text): continue
         text = row.text
-        if not text.startswith(' '): text = ' ' + text
+        text = ' ' + ' '.join(text.split())
+        tokens = tokenizer.tokenize(text)
+        offsets = list(accumulate(map(len, tokens)))
+        offsets = list(zip([0] + offsets, offsets))
         record = {}
-        encoding = tokenizer.encode(text)
-        record['tokens_id'] = encoding.ids
+        record['tokens_id'] = tokenizer.convert_tokens_to_ids(tokens)
         record['sentiment'] = sentiment_hash[row.sentiment]
-        record['offsets'] = encoding.offsets
+        record['offsets'] = offsets
         record['text'] = text
         record['id'] = row.textID
         output.append(record)
@@ -47,24 +49,29 @@ def collect_func(records):
     texts = []
     for rec in records:
         ids.append(rec['id'])
-        inputs.append(torch.LongTensor([rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
+        inputs.append(torch.LongTensor([cls_token_id, rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
         offsets.append(rec['offsets'])
         texts.append(rec['text'])
     return ids, pad_sequence(inputs, batch_first=True, padding_value=pad_token_id).cuda(), offsets, texts
 
 
-class RobertaForQuestionAnswering(BertPreTrainedModel):
+class AlbertForQuestionAnswering(BertPreTrainedModel):
     def __init__(self, config):
-        super(RobertaForQuestionAnswering, self).__init__(config)
-        self.roberta = RobertaModel(config)
-        self.logits = nn.Linear(config.hidden_size*2, 2)
-        self.bn = nn.BatchNorm1d(config.hidden_size*2)
+        super(AlbertForQuestionAnswering, self).__init__(config)
+        self.albert = AlbertModel(config)
+        # self.logits = nn.Linear(config.hidden_size*2, 2)
+        self.logits = nn.Sequential(nn.Linear(config.hidden_size*2, config.hidden_size), nn.Tanh(), nn.Linear(config.hidden_size, 2))
         self.dropout = nn.Dropout(0.5)
         self.init_weights()
+        # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
     def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
-        outputs = self.roberta(input_ids, attention_mask=attention_mask)
+        token_type_ids = torch.ones(input_ids.shape).long().cuda()
+        token_type_ids[:,:3] = 0
+        outputs = self.albert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
         hidden_states = torch.cat([outputs[0], outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
+        # hidden_states = outputs[0]
+        # start_end_logits = self.logits(self.dropout(self.bn(hidden_states.reshape(-1, hidden_states.shape[-1])).reshape_as(hidden_states)))
         start_end_logits = self.logits(self.dropout(hidden_states))
         start_logits, end_logits = start_end_logits.split(1, dim=-1)
 
@@ -78,7 +85,7 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
 
         if not self.training:
             p_mask = attention_mask.float()  # 1 for available 0 for unavailable
-            p_mask[:, :2] = 0.0
+            p_mask[:, :3] = 0.0
             start_logits = start_logits.squeeze(-1) * p_mask - 1e30 * (1 - p_mask)
             end_logits = end_logits.squeeze(-1) * p_mask - 1e30 * (1- p_mask)
             return start_logits, end_logits
@@ -102,17 +109,16 @@ def pridect_epoch(model, dataiter, starts_logits_5cv, ends_logits_5cv):
 
 @click.command()
 @click.option('--test-path', default='../input/test.csv')
-@click.option('--vocab', default='../model/roberta-l12/vocab.json')
-@click.option('--merges', default='../model/roberta-l12/merges.txt')
+@click.option('--sp_model', default='../model/albert.base/spiece.model')
 @click.option('--models', default='trained.models')
-@click.option('--config', default='../model/roberta-l12/config.json')
-def main(test_path, vocab, merges, models, config):
-    tokenizer = ByteLevelBPETokenizer(vocab, merges, lowercase=True, add_prefix_space=True)
+@click.option('--config', default='../model/albert.base/config.json')
+def main(test_path, sp_model, models, config):
+    tokenizer = AlbertTokenizer(sp_model, do_lower_case=True)
     test_df = pd.read_csv(test_path)
     test = preprocess(tokenizer, test_df)
     model_config = BertConfig.from_json_file(config)
     saved_models = torch.load(models)
-    model = RobertaForQuestionAnswering(model_config).cuda()
+    model = AlbertForQuestionAnswering(model_config).cuda()
     testiter = DataLoader(test, batch_size=32, shuffle=False, collate_fn=collect_func)
     print(f"5cv {saved_models['score']}")
     starts_logits_5cv = {}
@@ -128,16 +134,16 @@ def main(test_path, vocab, merges, models, config):
         for id, offset, text in zip(ids, offsets, texts):
             start = end = None
             for i_s in torch.argsort(starts_logits_5cv[id], descending=True):
-                if i_s > 1 and i_s < len(offset)+2:
+                if i_s > 1 and i_s < len(offset)+3:
                     start = i_s
                     break
             for i_e in torch.argsort(ends_logits_5cv[id], descending=True):
-                if i_e >= start and i_e < len(offset)+2:
+                if i_e >= start and i_e < len(offset)+3:
                     end = i_e
                     break
             assert start is not None
             assert end is not None
-            submit.selected_text[submit.textID == id] = text[offset[start-2][0]: offset[end-2][1]]
+            submit.selected_text[submit.textID == id] = text[offset[start-3][0]: offset[end-3][1]]
     submit.to_csv("submission.csv", index=False)
 
 
