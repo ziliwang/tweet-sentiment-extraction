@@ -47,7 +47,7 @@ def collect_func(records):
     texts = []
     for rec in records:
         ids.append(rec['id'])
-        inputs.append(torch.LongTensor([rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
+        inputs.append(torch.LongTensor([cls_token_id, rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
         offsets.append(rec['offsets'])
         texts.append(rec['text'])
     return ids, pad_sequence(inputs, batch_first=True, padding_value=pad_token_id).cuda(), offsets, texts
@@ -58,7 +58,6 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
         super(RobertaForQuestionAnswering, self).__init__(config)
         self.roberta = RobertaModel(config)
         self.logits = nn.Linear(config.hidden_size*2, 2)
-        self.bn = nn.BatchNorm1d(config.hidden_size*2)
         self.dropout = nn.Dropout(0.5)
         self.init_weights()
 
@@ -78,7 +77,7 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
 
         if not self.training:
             p_mask = attention_mask.float()  # 1 for available 0 for unavailable
-            p_mask[:, :2] = 0.0
+            p_mask[:, :3] = 0.0
             start_logits = start_logits.squeeze(-1) * p_mask - 1e30 * (1 - p_mask)
             end_logits = end_logits.squeeze(-1) * p_mask - 1e30 * (1- p_mask)
             return start_logits, end_logits
@@ -120,24 +119,26 @@ def main(test_path, vocab, merges, models, config):
     for state_dict in saved_models['models']:
         model.load_state_dict(state_dict)
         pridect_epoch(model, testiter, starts_logits_5cv, ends_logits_5cv)
-    test = pd.read_csv(test_path)
     submit = pd.DataFrame()
-    submit['textID'] = test['textID']
-    submit['selected_text'] = [''] * submit.shape[0]
+    submit['textID'] = test_df['textID']
+    submit['selected_text'] = test_df['text']
+    id2sentiment = dict((r.textID, r.sentiment) for _, r in test_df.iterrows())
     for ids, _, offsets, texts in testiter:
         for id, offset, text in zip(ids, offsets, texts):
+            if id2sentiment[id] == 'neutral':
+                continue
             start = end = None
             for i_s in torch.argsort(starts_logits_5cv[id], descending=True):
-                if i_s > 1 and i_s < len(offset)+2:
+                if i_s > 1 and i_s < len(offset)+3:
                     start = i_s
                     break
             for i_e in torch.argsort(ends_logits_5cv[id], descending=True):
-                if i_e >= start and i_e < len(offset)+2:
+                if i_e >= start and i_e < len(offset)+3:
                     end = i_e
                     break
             assert start is not None
             assert end is not None
-            submit.selected_text[submit.textID == id] = text[offset[start-2][0]: offset[end-2][1]]
+            submit.selected_text[submit.textID == id] = text[offset[start-3][0]: offset[end-3][1]]
     submit.to_csv("submission.csv", index=False)
 
 

@@ -165,9 +165,9 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
 
 
 @click.command()
-@click.option('--data', default='cased_roberta.input.joblib')
+@click.option('--data', default='roberta.input.joblib')
 @click.option('--pretrained', default='../model/roberta-l12/')
-@click.option('--lr', default=3e-5)
+@click.option('--lr', default=5e-5)
 @click.option('--batch-size', default=32)
 @click.option('--epoch', default=3)
 @click.option('--accumulate-step', default=1)
