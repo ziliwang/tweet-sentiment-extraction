@@ -108,7 +108,7 @@ def main(vocab, merges, data_path, lower, save_path):
         ann['sentiment'] = sentiment_hash[row.sentiment]
         ann['id'] = row.textID
         dataset.append(ann)
-        decode = row.text[ann['offsets'][ann['start']][0]:ann['offsets'][ann['end']][1]]
+        decode = ann['text'][ann['offsets'][ann['start']][0]:ann['offsets'][ann['end']][1]]
         if set(decode.split()) != set(ann['gt'].split()):
             nm+=1
         score += jaccard(decode, ann['gt'])

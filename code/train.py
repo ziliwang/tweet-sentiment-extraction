@@ -4,7 +4,8 @@ from torch.nn import functional as F
 from transformers import *
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
-from sklearn.model_selection import train_test_split, KFold
+from torch.nn.utils import clip_grad_norm_
+from sklearn.model_selection import train_test_split, KFold, StratifiedKFold
 import joblib
 import click
 import random
@@ -27,9 +28,9 @@ def collect_func(records):
     texts = []
     gts = []
     for rec in records:
-        inputs.append(torch.LongTensor([rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
-        starts.append(rec['start']+2)
-        ends.append(rec['end']+2)
+        inputs.append(torch.LongTensor([cls_token_id, rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
+        starts.append(rec['start']+3)
+        ends.append(rec['end']+3)
         offsets.append(rec['offsets'])
         texts.append(rec['text'])
         gts.append(rec['gt'])
@@ -57,6 +58,7 @@ def train_epoch(model, optimizer, lr_scheduler, dataiter, accumulate_step):
         loss = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long(), start_positions=starts, end_positions=ends)
         cum_loss += loss.sum().detach().cpu().data.numpy()
         loss.mean().backward()
+        # clip_grad_norm_(model.parameters(), 2)
         if step % accumulate_step == 0:
             optimizer.step()
             lr_scheduler.step()
@@ -85,17 +87,19 @@ def validate_epoch(model, dataiter):
             for i in range(batch_size):
                 start = None
                 for i_s in start_top5[i]:
-                    if i_s > 1 and i_s < len(offsets[i])+2:
+                    if i_s > 1 and i_s < len(offsets[i])+3:
                         start = i_s
                         break
                 end = None
                 for i_e in end_top5[i]:
-                    if i_e >= i_s and i_e < len(offsets[i])+2:
+                    if i_e >= i_s and i_e < len(offsets[i])+3:
                         end = i_e
                         break
                 assert start is not None
                 assert end is not None
-                predict = texts[i][offsets[i][start-2][0]: offsets[i][end-2][1]]
+                predict = texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]]
+                if inputs[i][1] == 7974:
+                    predict = texts[i]
                 score += jaccard(gts[i], predict)
     return score/sample_counts
 
@@ -123,14 +127,21 @@ def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_datait
 class RobertaForQuestionAnswering(BertPreTrainedModel):
     def __init__(self, config):
         super(RobertaForQuestionAnswering, self).__init__(config)
+        setattr(config, 'output_hidden_states', True)
         self.roberta = RobertaModel(config)
         self.logits = nn.Linear(config.hidden_size*2, 2)
+        # self.logits = nn.Sequential(nn.Linear(config.hidden_size*2, config.hidden_size), nn.Tanh(), nn.Linear(config.hidden_size, 2))
         self.dropout = nn.Dropout(0.5)
+        # nn.init.xavier_uniform_(self.logits.weight)
         self.init_weights()
         # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
     def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
         outputs = self.roberta(input_ids, attention_mask=attention_mask)
+        # hidden_states = torch.cat([torch.stack(outputs[-1][-6:], dim=-1).max(-1)[0], outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
+        # hidden_states = torch.stack(outputs[-1][-6:], dim=-1).max(-1)[0]
+        # hidden_states = torch.cat([torch.stack(outputs[-1][-4:], dim=-1).mean(-1), outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
+        # hidden_states = torch.cat([torch.cat(outputs[-1][-4:], dim=-1), outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
         hidden_states = torch.cat([outputs[0], outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
         # hidden_states = outputs[0]
         # start_end_logits = self.logits(self.dropout(self.bn(hidden_states.reshape(-1, hidden_states.shape[-1])).reshape_as(hidden_states)))
@@ -147,7 +158,7 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
 
         if not self.training:
             p_mask = attention_mask.float()  # 1 for available 0 for unavailable
-            p_mask[:, :2] = 0.0
+            p_mask[:, :3] = 0.0
             start_logits = start_logits.squeeze(-1) * p_mask - 1e30 * (1 - p_mask)
             end_logits = end_logits.squeeze(-1) * p_mask - 1e30 * (1- p_mask)
             return start_logits, end_logits
@@ -167,10 +178,11 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
     best_models = []
     best_scores = []
     k = 0
-    for train_idx, val_idx in KFold(n_splits=5, random_state=seed).split(data):
+    for train_idx, val_idx in StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
         k += 1
         print(f'---- {k} Fold ---')
-        train = [data[i] for i in train_idx]
+        train = [data[i] for i in train_idx if data[i]['sentiment'] != 7974]
+        # train = [data[i] for i in train_idx]
         val = [data[i] for i in val_idx]
         model = RobertaForQuestionAnswering.from_pretrained(pretrained).cuda()
         no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
