@@ -2,6 +2,7 @@ import torch
 from torch import nn, optim
 from torch.nn import functional as F
 from transformers import AlbertTokenizer, AlbertModel, AdamW, BertPreTrainedModel, get_linear_schedule_with_warmup
+from transformers.modeling_albert import *
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from torch.nn.utils import clip_grad_norm_
@@ -59,7 +60,7 @@ def train_epoch(model, optimizer, lr_scheduler, dataiter, accumulate_step):
         loss = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long(), start_positions=starts, end_positions=ends)
         cum_loss += loss.sum().detach().cpu().data.numpy()
         loss.mean().backward()
-        clip_grad_norm_(model.parameters(), 0.5)
+        # clip_grad_norm_(model.parameters(), 1)
         if step % accumulate_step == 0:
             optimizer.step()
             lr_scheduler.step()
@@ -81,25 +82,43 @@ def validate_epoch(model, dataiter):
     with torch.no_grad():
         for inputs, _, _, offsets, texts, gts in dataiter:
             start_logits, end_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
-            _, start_index = torch.topk(start_logits, 20)
-            _, end_index = torch.topk(end_logits, 20)
+            s_top_probs, s_top_idxs = torch.topk(start_logits.softmax(-1), 5)
+            e_top_probs, e_top_idxs = torch.topk(end_logits.softmax(-1), 5)
             batch_size = inputs.shape[0]
             sample_counts += batch_size
             for i in range(batch_size):
-                start = None
-                for i_s in start_index[i]:
-                    if i_s > 1 and i_s < len(offsets[i])+3:
-                        start = i_s
-                        break
-                end = None
-                for i_e in end_index[i]:
-                    if i_e >= start and i_e < len(offsets[i])+3:
-                        end = i_e
-                        break
-                assert start is not None
-                if end is None:
-                    end = start
+                c = []
+                for _i, s_idx in enumerate(s_top_idxs[i]):
+                    for _j, e_idx in enumerate(e_top_idxs[i]):
+                        if s_idx <= e_idx:
+                            c.append((s_top_probs[i][_i]*e_top_probs[i][_j], s_idx, e_idx))
+                _, start, end = sorted(c)[-1]
+                # c.sort(key=lambda x: x[-1], reverse=True)
+                # start, end, _ = c[0]
+                # predict = texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]]
+                # for start, end, _ in c:
+                #     predict = texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]]
+                #     if len(predict) / len(texts[i]) < 0.3 or len(predict) / len(texts[i]) > 0.9:
+                #         break
+                # start = s_top_idxs[i][0]
+                # for i_s in s_top_idxs[i]:
+                #     if i_s < len(offsets[i])+3:
+                #         start = i_s
+                #         break
+                # end = None
+                # for i_e in e_top_idxs[i]:
+                #     if i_e >= start:
+                #         end = i_e
+                #         break
+                # if end is None:
+                #     end = start
                 predict = texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]]
+                # if len(predict) / texts[i] > 0.4:
+                #     predict = texts[i]
+                if inputs[i][1] == 8387:
+                    predict = texts[i]
+                # if jaccard(gts[i], predict) < 0.5:
+                #     print(f"text:'{texts[i]}'\ngt:'{gts[i]}'\npd:'{predict}'")
                 score += jaccard(gts[i], predict)
     return score/sample_counts
 
@@ -127,10 +146,13 @@ def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_datait
 class AlbertForQuestionAnswering(BertPreTrainedModel):
     def __init__(self, config):
         super(AlbertForQuestionAnswering, self).__init__(config)
+        setattr(config, 'output_hidden_states', True)
         self.albert = AlbertModel(config)
-        # self.logits = nn.Linear(config.hidden_size*2, 2)
-        self.logits = nn.Sequential(nn.Linear(config.hidden_size*2, config.hidden_size), nn.Tanh(), nn.Linear(config.hidden_size, 2))
-        self.dropout = nn.Dropout(0.5)
+        decoder_config = AlbertConfig(num_hidden_layers=3, embedding_size=config.hidden_size*2, hidden_size=128)
+        self.decoder = AlbertTransformer(decoder_config)
+        self.logits = nn.Linear(128, 2)
+        # self.logits = nn.Sequential(nn.Linear(config.hidden_size*5, config.hidden_size), nn.Tanh(), nn.Linear(config.hidden_size, 2))
+        self.dropout = nn.Dropout(0.3)
         self.init_weights()
         # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
@@ -138,9 +160,18 @@ class AlbertForQuestionAnswering(BertPreTrainedModel):
         token_type_ids = torch.ones(input_ids.shape).long().cuda()
         token_type_ids[:,:3] = 0
         outputs = self.albert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+        # hidden_states = torch.cat([torch.stack(outputs[-1][-4:], dim=-1).max(-1)[0], outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
         hidden_states = torch.cat([outputs[0], outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
+        decoder_att = attention_mask.float() * (input_ids != sep_token_id).float()
+        decoder_att[:,:2] = .0
+        decoder_att = decoder_att.unsqueeze(1).unsqueeze(2)
+        decoder_att = (1.0 - decoder_att) * -10000.0
+        outputs = self.decoder(hidden_states, attention_mask=decoder_att, head_mask=[None]* self.decoder.config.num_hidden_layers)
+        # hidden_states = torch.cat([torch.cat(outputs[-1][-4:], dim=-1), outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
+        # hidden_states = torch.stack(outputs[-1][-6:], dim=-1).max(-1)[0]
         # hidden_states = outputs[0]
         # start_end_logits = self.logits(self.dropout(self.bn(hidden_states.reshape(-1, hidden_states.shape[-1])).reshape_as(hidden_states)))
+        hidden_states = outputs[0]
         start_end_logits = self.logits(self.dropout(hidden_states))
         start_logits, end_logits = start_end_logits.split(1, dim=-1)
 
@@ -153,7 +184,7 @@ class AlbertForQuestionAnswering(BertPreTrainedModel):
             return start_loss + end_loss
 
         if not self.training:
-            p_mask = attention_mask.float()  # 1 for available 0 for unavailable
+            p_mask = attention_mask.float() * (input_ids != sep_token_id).float()  # 1 for available 0 for unavailable
             p_mask[:, :3] = 0.0
             start_logits = start_logits.squeeze(-1) * p_mask - 1e30 * (1 - p_mask)
             end_logits = end_logits.squeeze(-1) * p_mask - 1e30 * (1- p_mask)
@@ -177,13 +208,18 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
     for train_idx, val_idx in StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
         k += 1
         print(f'---- {k} Fold ---')
-        train = [data[i] for i in train_idx]
+        # train = [data[i] for i in train_idx]
+        train = [data[i] for i in train_idx if data[i]['sentiment'] != 8387]
         val = [data[i] for i in val_idx]
         model = AlbertForQuestionAnswering.from_pretrained(pretrained).cuda()
         no_decay = ['.bias', 'full_layer_layer_norm.weight', 'LayerNorm.weight', ]
-        optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+        optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay) and 'albert.' in n],
+                            "lr": lr*0.1, 'weight_decay': 1e-2},
+                           {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay) and 'albert.' in n],
+                            "lr": lr*0.1, 'weight_decay': 0},
+                           {"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay) and 'albert.' not in n],
                             "lr": lr, 'weight_decay': 1e-2},
-                           {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                           {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay) and 'albert.' not in n],
                             "lr": lr, 'weight_decay': 0}])
         train_steps = np.ceil(len(train) / batch_size / accumulate_step * epoch)
         lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1*train_steps, num_training_steps=train_steps)
