@@ -6,6 +6,7 @@ from transformers.modeling_electra import *
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from sklearn.model_selection import train_test_split, KFold
+from sklearn.model_selection import StratifiedKFold
 import joblib
 import click
 import random
@@ -122,8 +123,9 @@ class EletraForQuestionAnswering(ElectraPreTrainedModel):
     def __init__(self, config):
         super(EletraForQuestionAnswering, self).__init__(config)
         self.bert = ElectraModel(config)
-        self.logits = nn.Sequential(nn.Linear(config.hidden_size*2, config.hidden_size*2), nn.Tanh(), nn.Linear(config.hidden_size*2, 2))
-        self.dropout = nn.Dropout(0.0)
+        # self.logits = nn.Sequential(nn.Linear(config.hidden_size*2, config.hidden_size*2), nn.Tanh(), nn.Linear(config.hidden_size*2, 2))
+        self.logits = nn.Linear(config.hidden_size*2, 2)
+        self.dropout = nn.Dropout(0.3)
         self.init_weights()
 
     def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
@@ -166,7 +168,7 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
     best_models = []
     best_scores = []
     k = 0
-    for train_idx, val_idx in KFold(n_splits=5, random_state=seed).split(data):
+    for train_idx, val_idx in StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
         k += 1
         print(f'---- {k} Fold ---')
         train = [data[i] for i in train_idx if data[i]['sentiment'] != 8699]
