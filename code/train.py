@@ -59,7 +59,7 @@ def train_epoch(model, optimizer, lr_scheduler, dataiter, accumulate_step):
         loss = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long(), start_positions=starts, end_positions=ends)
         cum_loss += loss.sum().detach().cpu().data.numpy()
         loss.mean().backward()
-        # clip_grad_norm_(model.parameters(), 2)
+        clip_grad_norm_(model.parameters(), 1)
         if step % accumulate_step == 0:
             optimizer.step()
             lr_scheduler.step()
