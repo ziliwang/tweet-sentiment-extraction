@@ -2,6 +2,7 @@ import torch
 from torch import nn, optim
 from torch.nn import functional as F
 from transformers import *
+from transformers.modeling_electra import *
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from sklearn.model_selection import train_test_split, KFold
@@ -27,9 +28,9 @@ def collect_func(records):
     texts = []
     gts = []
     for rec in records:
-        inputs.append(torch.LongTensor([rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
-        starts.append(rec['start']+2)
-        ends.append(rec['end']+2)
+        inputs.append(torch.LongTensor([cls_token_id, rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
+        starts.append(rec['start']+3)
+        ends.append(rec['end']+3)
         offsets.append(rec['offsets'])
         texts.append(rec['text'])
         gts.append(rec['gt'])
@@ -57,6 +58,7 @@ def train_epoch(model, optimizer, lr_scheduler, dataiter, accumulate_step):
         loss = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long(), start_positions=starts, end_positions=ends)
         cum_loss += loss.sum().detach().cpu().data.numpy()
         loss.mean().backward()
+        # clip_grad_norm_(model.parameters(), 2)
         if step % accumulate_step == 0:
             optimizer.step()
             lr_scheduler.step()
@@ -78,24 +80,20 @@ def validate_epoch(model, dataiter):
     with torch.no_grad():
         for inputs, _, _, offsets, texts, gts in dataiter:
             start_logits, end_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
-            _, start_top5 = torch.topk(start_logits, 20)
-            _, end_top5 = torch.topk(end_logits, 20)
+            s_top_probs, s_top_idxs = torch.topk(start_logits.softmax(-1), 5)
+            e_top_probs, e_top_idxs = torch.topk(end_logits.softmax(-1), 5)
             batch_size = inputs.shape[0]
             sample_counts += batch_size
             for i in range(batch_size):
-                start = None
-                for i_s in start_top5[i]:
-                    if i_s > 1 and i_s < len(offsets[i])+2:
-                        start = i_s
-                        break
-                end = None
-                for i_e in end_top5[i]:
-                    if i_e >= i_s and i_e < len(offsets[i])+2:
-                        end = i_e
-                        break
-                assert start is not None
-                assert end is not None
-                predict = texts[i][offsets[i][start-2][0]: offsets[i][end-2][1]]
+                c = []
+                for _i, s_idx in enumerate(s_top_idxs[i]):
+                    for _j, e_idx in enumerate(e_top_idxs[i]):
+                        if s_idx <= e_idx:
+                            c.append((s_top_probs[i][_i]*e_top_probs[i][_j], s_idx, e_idx))
+                _, start, end = sorted(c)[-1]
+                predict = texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]]
+                if inputs[i][1] == 8699:
+                    predict = texts[i]
                 score += jaccard(gts[i], predict)
     return score/sample_counts
 
@@ -120,23 +118,21 @@ def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_datait
     return best_score, best_model
 
 
-class BertForQuestionAnswering(BertPreTrainedModel):
+class EletraForQuestionAnswering(ElectraPreTrainedModel):
     def __init__(self, config):
-        super(BertForQuestionAnswering, self).__init__(config)
-        self.bert = BertModel(config)
-        self.logits = nn.Linear(config.hidden_size, 2)
-        self.dropout = nn.Dropout(0.2)
+        super(EletraForQuestionAnswering, self).__init__(config)
+        self.bert = ElectraModel(config)
+        self.logits = nn.Sequential(nn.Linear(config.hidden_size*2, config.hidden_size*2), nn.Tanh(), nn.Linear(config.hidden_size*2, 2))
+        self.dropout = nn.Dropout(0.0)
         self.init_weights()
 
-    def forward(self, input_ids, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None,
-                start_positions=None, end_positions=None):
+    def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
+        token_type_ids = torch.ones(input_ids.shape).long().cuda()
+        token_type_ids[:,:3] = 0
         outputs = self.bert(input_ids,
                             attention_mask=attention_mask,
-                            token_type_ids=token_type_ids,
-                            position_ids=position_ids,
-                            head_mask=head_mask)
-
-        hidden_states = outputs[0]
+                            token_type_ids=token_type_ids)
+        hidden_states = torch.cat([outputs[0], outputs[0][:,0:1,:].expand_as(outputs[0])], dim=-1)
         start_end_logits = self.logits(self.dropout(hidden_states))
         start_logits, end_logits = start_end_logits.split(1, dim=-1)
 
@@ -149,7 +145,7 @@ class BertForQuestionAnswering(BertPreTrainedModel):
             return start_loss + end_loss
 
         if not self.training:
-            p_mask = attention_mask.float()  # 1 for available 0 for unavailable
+            p_mask = attention_mask.float() * (input_ids != sep_token_id).float()  # 1 for available 0 for unavailable
             p_mask[:, :2] = 0.0
             start_logits = start_logits.squeeze(-1) * p_mask - 1e30 * (1 - p_mask)
             end_logits = end_logits.squeeze(-1) * p_mask - 1e30 * (1- p_mask)
@@ -157,11 +153,11 @@ class BertForQuestionAnswering(BertPreTrainedModel):
 
 
 @click.command()
-@click.option('--data', default='bert.input.joblib')
-@click.option('--pretrained', default='../model/bert-l12')
-@click.option('--lr', default=3e-5)
+@click.option('--data', default='eletra.input.joblib')
+@click.option('--pretrained', default='../model/eletra.d.base')
+@click.option('--lr', default=5e-5)
 @click.option('--batch-size', default=32)
-@click.option('--epoch', default=5)
+@click.option('--epoch', default=3)
 @click.option('--accumulate-step', default=1)
 @click.option('--seed', default=9895)
 def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
@@ -173,15 +169,12 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
     for train_idx, val_idx in KFold(n_splits=5, random_state=seed).split(data):
         k += 1
         print(f'---- {k} Fold ---')
-        train = [data[i] for i in train_idx]
+        train = [data[i] for i in train_idx if data[i]['sentiment'] != 8699]
         val = [data[i] for i in val_idx]
-        model = BertForQuestionAnswering.from_pretrained(pretrained, num_labels=2).cuda()
+        model = EletraForQuestionAnswering.from_pretrained(pretrained).cuda()
         no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
-        model_layer_names = ['bert.embeddings']
-        model_layer_names += ['bert.encoder.layer.{}.'.format(i) for i in range(model.config.num_hidden_layers)]
-        model_layer_names += ['qa_outputs']
         optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-                            "lr": lr, 'weight_decay': 1e-3},
+                            "lr": lr, 'weight_decay': 1e-2},
                            {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
                             "lr": lr, 'weight_decay': 0}])
         train_steps = np.ceil(len(train) / batch_size / accumulate_step * epoch)
