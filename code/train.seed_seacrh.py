@@ -178,32 +178,42 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
 @click.option('--accumulate-step', default=1)
 @click.option('--seed', default=9895)
 def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
-    seed_everything(seed)
+    output = []
+    seeds = np.arange(500)
+    np.random.shuffle(seeds)
     data = joblib.load(data)
-    best_models = []
-    best_scores = []
-    k = 0
-    for train_idx, val_idx in StratifiedKFold(n_splits=5, random_state=9895).split(data, [i['sentiment'] for i in data]):
-        k += 1
-        print(f'---- {k} Fold ---')
-        train = [data[i] for i in train_idx if data[i]['sentiment'] != 7974]
-        # train = [data[i] for i in train_idx]
-        val = [data[i] for i in val_idx]
-        model = RobertaForQuestionAnswering.from_pretrained(pretrained).cuda()
-        no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
-        optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-                            "lr": lr, 'weight_decay': 1e-2},
-                           {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-                            "lr": lr, 'weight_decay': 0}])
-        train_steps = np.ceil(len(train) / batch_size / accumulate_step * epoch)
-        lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1*train_steps, num_training_steps=train_steps)
-        trainiter = DataLoader(train, batch_size=batch_size, shuffle=True, collate_fn=collect_func)
-        valiter = DataLoader(val, batch_size=batch_size*2, shuffle=False, collate_fn=collect_func)
-        best_score, best_model = fold_train(model, optimizer, lr_scheduler, epoch, trainiter, valiter, accumulate_step)
-        best_scores.append(best_score)
-        best_models.append(best_model)
-    print(f'final cv {np.mean(best_scores)}')
-    torch.save({'models': best_models, 'score': np.mean(best_scores)}, 'trained.models')
+    for seed in seeds[:20]:
+        seed_everything(seed)
+        best_models = []
+        best_scores = []
+        k = 0
+        for train_idx, val_idx in StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
+            k += 1
+            print(f'---- {k} Fold ---')
+            train = [data[i] for i in train_idx if data[i]['sentiment'] != 7974]
+            # train = [data[i] for i in train_idx]
+            val = [data[i] for i in val_idx]
+            model = RobertaForQuestionAnswering.from_pretrained(pretrained).cuda()
+            no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
+            optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                                "lr": lr, 'weight_decay': 1e-2},
+                               {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                                "lr": lr, 'weight_decay': 0}])
+            train_steps = np.ceil(len(train) / batch_size / accumulate_step * epoch)
+            lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1*train_steps, num_training_steps=train_steps)
+            trainiter = DataLoader(train, batch_size=batch_size, shuffle=True, collate_fn=collect_func)
+            valiter = DataLoader(val, batch_size=batch_size*2, shuffle=False, collate_fn=collect_func)
+            best_score, best_model = fold_train(model, optimizer, lr_scheduler, epoch, trainiter, valiter, accumulate_step)
+            best_scores.append(best_score)
+            best_models.append(best_model)
+        print(f'final cv {np.mean(best_scores)}')
+        mean_score = np.mean(best_scores)
+        output.append((seed, mean_score))
+        if mean_score > 0.711:
+            torch.save({'models': best_models, 'score': mean_score}, f'trained.models.{seed}.{int(mean_score*10000)}')
+    with open('report.txt', 'w') as f:
+        for i, j in output:
+            f.writelines(f'{i},{j}\n')
 
 
 if __name__ == '__main__':
