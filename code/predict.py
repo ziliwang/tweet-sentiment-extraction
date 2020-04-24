@@ -68,59 +68,78 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
         self.init_weights()
         # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
-    def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
+    def inference_start(self, input_ids, attention_mask=None):
         outputs = self.roberta(input_ids, attention_mask=attention_mask)
         hidden_states = outputs[0]
         p_mask = 1 - attention_mask.float() * (input_ids != sep_token_id).float()
+        p_mask[:,:2] = 1.0
         start_logits = self.start_logits(hidden_states, p_mask=p_mask)
+        return start_logits
+        #
+        # if not self.training:
+        #     bsz, slen, hsz = hidden_states.size()
+        #     start_log_probs = start_logits.softmax(-1).log()  # shape (bsz, slen)
+        #
+        #     start_top_log_probs, start_top_index = torch.topk(start_log_probs, self.start_n_top, dim=-1)  # shape (bsz, start_n_top)
+        #     # start_top_log_probs = start_top_log_probs - start_log_probs[:, 0:1].expand(-1, self.start_n_top)
+        #     start_top_index_exp = start_top_index.unsqueeze(-1).expand(-1, -1, hsz)  # shape (bsz, start_n_top, hsz)
+        #     start_states = torch.gather(hidden_states, -2, start_top_index_exp)  # shape (bsz, start_n_top, hsz)
+        #     start_states = start_states.unsqueeze(1).expand(-1, slen, -1, -1)  # shape (bsz, slen, start_n_top, hsz)
+        #
+        #     hidden_states_expanded = hidden_states.unsqueeze(2).expand_as(start_states)  # shape (bsz, slen, start_n_top, hsz)
+        #     p_mask = p_mask.unsqueeze(-1) if p_mask is not None else None
+        #     end_logits = self.end_logits(hidden_states_expanded, start_states=start_states, p_mask=p_mask)
+        #     end_log_probs = F.softmax(end_logits, dim=1).log()  # shape (bsz, slen, start_n_top)
+        #
+        #     end_top_log_probs, end_top_index = torch.topk(end_log_probs, self.end_n_top, dim=1)  # shape (bsz, end_n_top, start_n_top)
+        #     # end_top_log_probs = end_top_log_probs - end_log_probs[:, 0:1, :].expand(-1, self.end_n_top, -1)
+        #     end_top_log_probs = end_top_log_probs.view(-1, self.start_n_top * self.end_n_top)
+        #     end_top_index = end_top_index.view(-1, self.start_n_top * self.end_n_top)
+        #
+        #     return start_top_log_probs, start_top_index, end_top_log_probs, end_top_index
 
-        if start_positions is not None and end_positions is not None:
-            for x in (start_positions, end_positions):
-                if x.dim() > 1:
-                    x.squeeze_(-1)
-            end_logits = self.end_logits(hidden_states, start_positions=start_positions, p_mask=p_mask)
-            start_loss = F.cross_entropy(start_logits.squeeze(-1), start_positions, reduction='none')
-            end_loss = F.cross_entropy(end_logits.squeeze(-1), end_positions, reduction='none')
-            return start_loss + end_loss
+    def inference_end(self, input_ids, attention_mask, start_logits):
+        outputs = self.roberta(input_ids, attention_mask=attention_mask)
+        hidden_states = outputs[0]
+        p_mask = 1 - attention_mask.float() * (input_ids != sep_token_id).float()
+        p_mask[:,:2] = 1.0
+        bsz, slen, hsz = hidden_states.size()
+        start_log_probs = start_logits.softmax(-1).log()  # shape (bsz, slen)
+        start_top_log_probs, start_top_index = torch.topk(start_log_probs, self.start_n_top, dim=-1)  # shape (bsz, start_n_top)
+        start_top_index_exp = start_top_index.unsqueeze(-1).expand(-1, -1, hsz)
+        start_states = torch.gather(hidden_states, -2, start_top_index_exp)  # shape (bsz, start_n_top, hsz)
+        start_states = start_states.unsqueeze(1).expand(-1, slen, -1, -1)  # shape (bsz, slen, start_n_top, hsz)
 
-        if not self.training:
-            bsz, slen, hsz = hidden_states.size()
-            start_log_probs = start_logits.softmax(-1).log()  # shape (bsz, slen)
+        hidden_states_expanded = hidden_states.unsqueeze(2).expand_as(start_states)  # shape (bsz, slen, start_n_top, hsz)
+        p_mask = p_mask.unsqueeze(-1) if p_mask is not None else None
+        end_logits = self.end_logits(hidden_states_expanded, start_states=start_states, p_mask=p_mask)
 
-            start_top_log_probs, start_top_index = torch.topk(start_log_probs, self.start_n_top, dim=-1)  # shape (bsz, start_n_top)
-            # start_top_log_probs = start_top_log_probs - start_log_probs[:, 0:1].expand(-1, self.start_n_top)
-            start_top_index_exp = start_top_index.unsqueeze(-1).expand(-1, -1, hsz)  # shape (bsz, start_n_top, hsz)
-            start_states = torch.gather(hidden_states, -2, start_top_index_exp)  # shape (bsz, start_n_top, hsz)
-            start_states = start_states.unsqueeze(1).expand(-1, slen, -1, -1)  # shape (bsz, slen, start_n_top, hsz)
-
-            hidden_states_expanded = hidden_states.unsqueeze(2).expand_as(start_states)  # shape (bsz, slen, start_n_top, hsz)
-            p_mask = p_mask.unsqueeze(-1) if p_mask is not None else None
-            end_logits = self.end_logits(hidden_states_expanded, start_states=start_states, p_mask=p_mask)
-            end_log_probs = F.softmax(end_logits, dim=1).log()  # shape (bsz, slen, start_n_top)
-
-            end_top_log_probs, end_top_index = torch.topk(end_log_probs, self.end_n_top, dim=1)  # shape (bsz, end_n_top, start_n_top)
-            # end_top_log_probs = end_top_log_probs - end_log_probs[:, 0:1, :].expand(-1, self.end_n_top, -1)
-            end_top_log_probs = end_top_log_probs.view(-1, self.start_n_top * self.end_n_top)
-            end_top_index = end_top_index.view(-1, self.start_n_top * self.end_n_top)
-
-            return start_top_log_probs, start_top_index, end_top_log_probs, end_top_index
+        return end_logits
 
 
-def pridect_epoch(model, dataiter, bagging_cache):
+def inference_start(model, dataiter, bagging_start_logits):
     model.eval()
     with torch.no_grad():
-        for ids, inputs, offsets, texts in dataiter:
-            s_top_probs, s_top_idxs, e_top_probs, e_top_idxs = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
-            for i in range(inputs.shape[0]):
-                if inputs[i][1] == 7974:
-                    continue
-                for _i, s_idx in enumerate(s_top_idxs[i]):
-                    if s_idx < 3: continue
-                    for _j, e_idx in enumerate(e_top_idxs[i]):
-                        if _j % model.end_n_top != _i: continue
-                        if s_idx <= e_idx and e_idx -3 < len(offsets[i]):
-                            cand_text = texts[i][offsets[i][s_idx-3][0]: offsets[i][e_idx-3][1]]
-                            bagging_cache[ids[i]][cand_text].append((s_top_probs[i][_i]+e_top_probs[i][_j]).detach().cpu().numpy())
+        for ids, inputs, _, _ in dataiter:
+            start_logits = model.inference_start(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
+            for i, logits in zip(ids, start_logits):
+                if i in bagging_start_logits:
+                    bagging_start_logits[i] += logits
+                else:
+                    bagging_start_logits[i] = logits
+
+
+def inference_end(model, dataiter, bagging_start_logits, bagging_end_logits):
+    model.eval()
+    with torch.no_grad():
+        for ids, inputs, _, _ in dataiter:
+            start_logits = torch.stack([bagging_start_logits[i] for i in ids])  # bsz, start_n_top
+            end_logits = model.inference_end(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long(), start_logits=start_logits)
+            for i, logits in zip(ids, end_logits):
+                if i in bagging_end_logits:
+                    bagging_end_logits[i] += logits
+                else:
+                    bagging_end_logits[i] = logits
 
 
 @click.command()
@@ -138,21 +157,46 @@ def main(test_path, vocab, merges, models, config):
     model = RobertaForQuestionAnswering(model_config).cuda()
     testiter = DataLoader(test, batch_size=32, shuffle=False, collate_fn=collect_func)
     print(f"5cv {saved_models['score']}")
-    bagging_cache = collections.defaultdict(lambda: collections.defaultdict(list))
+    print('inference start')
+    bagging_start_logits = {}
     for state_dict in saved_models['models']:
         model.load_state_dict(state_dict)
-        pridect_epoch(model, testiter, bagging_cache)
+        inference_start(model, testiter, bagging_start_logits)
+    print('inference end')
+    bagging_end_logits = {}
+    for state_dict in saved_models['models']:
+        model.load_state_dict(state_dict)
+        inference_end(model, testiter, bagging_start_logits, bagging_end_logits)
+    print('inference answer')
+    id2sentiment = dict((r.textID, r.sentiment) for _, r in test_df.iterrows())
+    predict = []
+    for ids, _, offsets, texts in testiter:
+
+        for id, offset, text in zip(ids, offsets, texts):
+            if id2sentiment[id] == 'neutral':
+                predict.append(text)
+                continue
+            start_logits = bagging_start_logits[id]
+            end_logits = bagging_end_logits[id]
+            start_log_probs = start_logits.softmax(-1).log()  # slen
+            start_top_log_probs, start_top_index = torch.topk(start_log_probs, model.start_n_top, dim=-1)  # shape (start_n_top)
+            end_log_probs = F.softmax(end_logits, dim=0).log()  # shape (slen, start_n_top)
+            end_top_log_probs, end_top_index = torch.topk(end_log_probs, model.end_n_top, dim=0)  # shape (end_n_top, start_n_top)
+            c = []
+            for _i, s_idx in enumerate(start_top_index):
+                if s_idx < 3:
+                    continue
+                for _j, e_idx in enumerate(end_top_index[:, _i]):
+                    if s_idx <= e_idx and e_idx -3 < len(offset):
+                        c.append((start_top_log_probs[_i]+end_top_log_probs[_j, _i], s_idx, e_idx))
+            if len(c) == 0:
+                print(start_top_log_probs, start_top_index, end_top_log_probs, end_top_index, len(offset))
+            _, start, end = sorted(c)[-1]
+            predict.append(text[offset[start-3][0]: offset[end-3][1]])
+
     submit = pd.DataFrame()
     submit['textID'] = test_df['textID']
-    submit['selected_text'] = test_df['text']
-
-    ans_mapping = {}
-
-    for item_id in bagging_cache:
-        ans, logprob = sorted(bagging_cache[item_id].items(), key=lambda x: np.mean(x[1]))[-1]
-        ans_mapping[item_id] = ans
-
-    submit['selected_text'] = submit.apply(lambda x: ans_mapping.get(x.textID, x.selected_text), axis=1)
+    submit['selected_text'] = predict
     submit.to_csv("submission.csv", index=False)
 
 

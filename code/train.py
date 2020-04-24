@@ -199,19 +199,21 @@ class RobertaForQuestionAnswering1(BertPreTrainedModel):
     def __init__(self, config):
         super(RobertaForQuestionAnswering1, self).__init__(config)
         self.roberta = RobertaModel(config)
-        self.logits = nn.Linear(config.hidden_size*2, 2)
         self.start_logits = PoolerStartLogits(config)
         self.end_logits = PoolerEndLogits(config)
         self.start_n_top = 5
         self.end_n_top = 5
+        self.dropout = nn.Dropout(0.1)
         # nn.init.xavier_uniform_(self.logits.weight)
         self.init_weights()
         # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
     def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
         outputs = self.roberta(input_ids, attention_mask=attention_mask)
-        hidden_states = outputs[0]
+        hidden_states = self.dropout(outputs[0])
+        # hidden_states = outputs[0]
         p_mask = 1 - attention_mask.float() * (input_ids != sep_token_id).float()
+        p_mask[:,:2] = 1
         start_logits = self.start_logits(hidden_states, p_mask=p_mask)
 
         if start_positions is not None and end_positions is not None:
