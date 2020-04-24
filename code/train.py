@@ -137,7 +137,7 @@ def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_datait
     best_model = deepcopy_state_dict_to_cpu(model)
     for e in range(epoch):
         loss = train_epoch(model, optimizer, lr_scheduler, train_dataiter, accumulate_step)
-        score = validate_epoch1(model, val_dataiter)
+        score = validate_epoch(model, val_dataiter)
         print(f'epoch {e} loss {loss:.6f} score: {score:.6f}')
         if score > best_score:
             best_score = score
@@ -268,7 +268,7 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
         train = [data[i] for i in train_idx if data[i]['sentiment'] != 7974]
         # train = [data[i] for i in train_idx]
         val = [data[i] for i in val_idx]
-        model = RobertaForQuestionAnswering1.from_pretrained(pretrained).cuda()
+        model = RobertaForQuestionAnswering.from_pretrained(pretrained).cuda()
         no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
         optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
                             "lr": lr, 'weight_decay': 1e-2},
