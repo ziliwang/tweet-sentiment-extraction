@@ -59,7 +59,6 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
     def __init__(self, config):
         super(RobertaForQuestionAnswering, self).__init__(config)
         self.roberta = RobertaModel(config)
-        self.logits = nn.Linear(config.hidden_size*2, 2)
         self.start_logits = PoolerStartLogits(config)
         self.end_logits = PoolerEndLogits(config)
         self.start_n_top = 5

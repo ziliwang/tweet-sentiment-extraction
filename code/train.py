@@ -263,7 +263,7 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
     best_models = []
     best_scores = []
     k = 0
-    for train_idx, val_idx in StratifiedKFold(n_splits=5, random_state=9895).split(data, [i['sentiment'] for i in data]):
+    for train_idx, val_idx in StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
         k += 1
         print(f'---- {k} Fold ---')
         train = [data[i] for i in train_idx if data[i]['sentiment'] != 7974]
