@@ -60,7 +60,7 @@ def train_epoch(model, optimizer, lr_scheduler, dataiter, accumulate_step):
         loss = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long(), start_positions=starts, end_positions=ends)
         cum_loss += loss.sum().detach().cpu().data.numpy()
         loss.mean().backward()
-        clip_grad_norm_(model.parameters(), 1)
+        # clip_grad_norm_(model.parameters(), 1)
         if step % accumulate_step == 0:
             optimizer.step()
             lr_scheduler.step()
@@ -137,7 +137,7 @@ def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_datait
     best_model = deepcopy_state_dict_to_cpu(model)
     for e in range(epoch):
         loss = train_epoch(model, optimizer, lr_scheduler, train_dataiter, accumulate_step)
-        score = validate_epoch(model, val_dataiter)
+        score = validate_epoch1(model, val_dataiter)
         print(f'epoch {e} loss {loss:.6f} score: {score:.6f}')
         if score > best_score:
             best_score = score
@@ -210,10 +210,11 @@ class RobertaForQuestionAnswering1(BertPreTrainedModel):
 
     def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
         outputs = self.roberta(input_ids, attention_mask=attention_mask)
+        # hidden_states = self.dropout(torch.cat([outputs[0], outputs[1][:,None,:].expand_as(outputs[0])], dim=-1))
         hidden_states = self.dropout(outputs[0])
         # hidden_states = outputs[0]
         p_mask = 1 - attention_mask.float() * (input_ids != sep_token_id).float()
-        p_mask[:,:2] = 1
+        p_mask[:, :2] = 1
         start_logits = self.start_logits(hidden_states, p_mask=p_mask)
 
         if start_positions is not None and end_positions is not None:
@@ -268,7 +269,7 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
         train = [data[i] for i in train_idx if data[i]['sentiment'] != 7974]
         # train = [data[i] for i in train_idx]
         val = [data[i] for i in val_idx]
-        model = RobertaForQuestionAnswering.from_pretrained(pretrained).cuda()
+        model = RobertaForQuestionAnswering1.from_pretrained(pretrained).cuda()
         no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
         optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
                             "lr": lr, 'weight_decay': 1e-2},
