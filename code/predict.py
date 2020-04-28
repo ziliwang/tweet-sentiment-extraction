@@ -7,6 +7,7 @@ from torch.nn.utils.rnn import pad_sequence
 from sklearn.model_selection import train_test_split, KFold
 import joblib
 import click
+import re
 import random
 import numpy as np
 import os
@@ -30,7 +31,7 @@ def preprocess(tokenizer, df):
         text = row.text
         if not text.startswith(' '): text = ' ' + text
         record = {}
-        encoding = tokenizer.encode(text)
+        encoding = tokenizer.encode(text.replace('`', "'"))
         record['tokens_id'] = encoding.ids
         record['sentiment'] = sentiment_hash[row.sentiment]
         record['offsets'] = encoding.offsets
@@ -57,15 +58,16 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
     def __init__(self, config):
         super(RobertaForQuestionAnswering, self).__init__(config)
         self.roberta = RobertaModel(config)
-        self.logits = nn.Linear(config.hidden_size*2, 2)
+        self.start_logits = nn.Sequential(nn.Linear(config.hidden_size*2, config.hidden_size), nn.Tanh(), nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps), nn.Linear(config.hidden_size, 1))
+        self.end_logits = nn.Sequential(nn.Linear(config.hidden_size*2, config.hidden_size), nn.Tanh(), nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps), nn.Linear(config.hidden_size, 1))
         self.dropout = nn.Dropout(0.5)
         self.init_weights()
 
     def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
         outputs = self.roberta(input_ids, attention_mask=attention_mask)
-        hidden_states = torch.cat([outputs[0], outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
-        start_end_logits = self.logits(self.dropout(hidden_states))
-        start_logits, end_logits = start_end_logits.split(1, dim=-1)
+        hidden_states = outputs[0]
+        start_logits = self.start_logits(self.dropout(torch.cat([hidden_states, outputs[1].unsqueeze(1).expand_as(hidden_states)], dim=-1)))
+        end_logits = self.end_logits(self.dropout(torch.cat([hidden_states, outputs[1].unsqueeze(1).expand_as(hidden_states)], dim=-1)))
 
         if start_positions is not None and end_positions is not None:
             for x in (start_positions, end_positions):
@@ -76,7 +78,7 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
             return start_loss + end_loss
 
         if not self.training:
-            p_mask = attention_mask.float()  # 1 for available 0 for unavailable
+            p_mask = attention_mask.float() * (input_ids != sep_token_id).float() # 1 for available 0 for unavailable
             p_mask[:, :3] = 0.0
             start_logits = start_logits.squeeze(-1) * p_mask - 1e30 * (1 - p_mask)
             end_logits = end_logits.squeeze(-1) * p_mask - 1e30 * (1- p_mask)
@@ -119,26 +121,27 @@ def main(test_path, vocab, merges, models, config):
     for state_dict in saved_models['models']:
         model.load_state_dict(state_dict)
         pridect_epoch(model, testiter, starts_logits_5cv, ends_logits_5cv)
-    submit = pd.DataFrame()
-    submit['textID'] = test_df['textID']
-    submit['selected_text'] = test_df['text']
     id2sentiment = dict((r.textID, r.sentiment) for _, r in test_df.iterrows())
+    filter_reg = re.compile(r'([\?\.\!]){2,}')
+    predicts = []
     for ids, _, offsets, texts in testiter:
         for id, offset, text in zip(ids, offsets, texts):
             if id2sentiment[id] == 'neutral':
+                predicts.append(text)
                 continue
-            start = end = None
-            for i_s in torch.argsort(starts_logits_5cv[id], descending=True):
-                if i_s > 1 and i_s < len(offset)+3:
-                    start = i_s
-                    break
-            for i_e in torch.argsort(ends_logits_5cv[id], descending=True):
-                if i_e >= start and i_e < len(offset)+3:
-                    end = i_e
-                    break
-            assert start is not None
-            assert end is not None
-            submit.selected_text[submit.textID == id] = text[offset[start-3][0]: offset[end-3][1]]
+            s_top_probs, s_top_idxs = torch.topk(starts_logits_5cv[id].softmax(-1).log(), 5)
+            e_top_probs, e_top_idxs = torch.topk(ends_logits_5cv[id].softmax(-1).log(), 5)
+            c = []
+            for _i, s_idx in enumerate(s_top_idxs):
+                if s_idx < 3: continue
+                for _j, e_idx in enumerate(e_top_idxs):
+                    if s_idx <= e_idx and e_idx -3 < len(offset):
+                        c.append((s_top_probs[_i]+e_top_probs[_j], s_idx, e_idx))
+            _, start, end = sorted(c)[-1]
+            predicts.append(filter_reg.sub(r'\1', text[offset[start-3][0]: offset[end-3][1]]))
+    submit = pd.DataFrame()
+    submit['textID'] = test_df['textID']
+    submit['selected_text'] = predicts
     submit.to_csv("submission.csv", index=False)
 
 

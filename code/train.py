@@ -80,23 +80,18 @@ def validate_epoch(model, dataiter):
     with torch.no_grad():
         for inputs, _, _, offsets, texts, gts in dataiter:
             start_logits, end_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
-            _, start_top5 = torch.topk(start_logits, 20)
-            _, end_top5 = torch.topk(end_logits, 20)
+            s_top_probs, s_top_idxs = torch.topk(start_logits.softmax(-1).log(), 5)
+            e_top_probs, e_top_idxs = torch.topk(end_logits.softmax(-1).log(), 5)
             batch_size = inputs.shape[0]
             sample_counts += batch_size
             for i in range(batch_size):
-                start = None
-                for i_s in start_top5[i]:
-                    if i_s > 2 and i_s < len(offsets[i])+3:
-                        start = i_s
-                        break
-                end = None
-                for i_e in end_top5[i]:
-                    if i_e >= i_s and i_e < len(offsets[i])+3:
-                        end = i_e
-                        break
-                assert start is not None
-                assert end is not None
+                c = []
+                for _i, s_idx in enumerate(s_top_idxs[i]):
+                    if s_idx < 3: continue
+                    for _j, e_idx in enumerate(e_top_idxs[i]):
+                        if s_idx <= e_idx and e_idx -3 < len(offsets[i]):
+                            c.append((s_top_probs[i][_i]+e_top_probs[i][_j], s_idx, e_idx))
+                _, start, end = sorted(c)[-1]
                 predict = texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]]
                 if inputs[i][1] == 7974:
                     predict = texts[i]
@@ -129,10 +124,11 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
         super(RobertaForQuestionAnswering, self).__init__(config)
         # setattr(config, 'output_hidden_states', True)
         self.roberta = RobertaModel(config)
-        self.start_logits = nn.Linear(config.hidden_size*2, 1)
+        # self.start_logits = nn.Linear(config.hidden_size*2, 1)
+        self.start_logits = nn.Sequential(nn.Linear(config.hidden_size*2, config.hidden_size), nn.Tanh(), nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps), nn.Linear(config.hidden_size, 1))
         self.end_logits = nn.Sequential(nn.Linear(config.hidden_size*2, config.hidden_size), nn.Tanh(), nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps), nn.Linear(config.hidden_size, 1))
         # self.logits = nn.Sequential(nn.Linear(config.hidden_size*2, config.hidden_size), nn.Tanh(), nn.Linear(config.hidden_size, 2))
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(0.5)
         # nn.init.xavier_uniform_(self.logits.weight)
         self.init_weights()
         # torch.nn.init.normal_(self.logits.weight, std=0.02)
@@ -146,25 +142,26 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
         # hidden_states = torch.cat([torch.stack(outputs[-1][-4:], dim=-1).mean(-1), outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
         # hidden_states = torch.cat([torch.cat(outputs[-1][-4:], dim=-1), outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
         hidden_states = outputs[0]
-        start_logits = self.start_logits(torch.cat([hidden_states, outputs[1].unsqueeze(1).expand_as(hidden_states)], dim=-1))
+        start_logits = self.start_logits(self.dropout(torch.cat([hidden_states, outputs[1].unsqueeze(1).expand_as(hidden_states)], dim=-1)))
         # start_end_logits = self.logits(self.dropout(self.bn(hidden_states.reshape(-1, hidden_states.shape[-1])).reshape_as(hidden_states)))
+        end_logits = self.end_logits(self.dropout(torch.cat([hidden_states, outputs[1].unsqueeze(1).expand_as(hidden_states)], dim=-1)))
 
         if start_positions is not None and end_positions is not None:
             for x in (start_positions, end_positions):
                 if x.dim() > 1:
                     x.squeeze_(-1)
-            start_states = hidden_states.gather(-2, start_positions[:, None, None].expand_as(hidden_states))
-            end_logits = self.end_logits(torch.cat([hidden_states, start_states], dim=-1))
+            # start_states = hidden_states.gather(-2, start_positions[:, None, None].expand_as(hidden_states))
+            # end_logits = self.end_logits(self.dropout(torch.cat([hidden_states, start_states], dim=-1)))
             start_loss = F.cross_entropy(start_logits.squeeze(-1), start_positions, reduction='none')
             end_loss = F.cross_entropy(end_logits.squeeze(-1), end_positions, reduction='none')
-            return start_loss + end_loss*0.5
+            return start_loss + end_loss
 
         if not self.training:
             p_mask = attention_mask.float() * (input_ids != sep_token_id).float() # 1 for available 0 for unavailable
             p_mask[:, :3] = 0.0
             start_logits = start_logits.squeeze(-1) * p_mask - 1e30 * (1 - p_mask)
-            start_states = torch.einsum("blh,bl->bh", hidden_states, start_logits.softmax(-1))
-            end_logits = self.end_logits(torch.cat([hidden_states, start_states[:,None,:].expand_as(hidden_states)], dim=-1))
+            # start_states = torch.einsum("blh,bl->bh", hidden_states, start_logits.softmax(-1))
+            # end_logits = self.end_logits(torch.cat([hidden_states, start_states[:,None,:].expand_as(hidden_states)], dim=-1))
             end_logits = end_logits.squeeze(-1) * p_mask - 1e30 * (1- p_mask)
             return start_logits, end_logits
 
@@ -186,8 +183,8 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
     for train_idx, val_idx in StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
         k += 1
         print(f'---- {k} Fold ---')
-        train = [data[i] for i in train_idx if data[i]['sentiment'] != 7974]
-        # train = [data[i] for i in train_idx]
+        # train = [data[i] for i in train_idx if data[i]['sentiment'] != 7974]
+        train = [data[i] for i in train_idx]
         val = [data[i] for i in val_idx]
         model = RobertaForQuestionAnswering.from_pretrained(pretrained).cuda()
         no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
