@@ -32,7 +32,7 @@ def preprocess(tokenizer, df):
         text = row.text
         if not text.startswith(' '): text = ' ' + text
         record = {}
-        encoding = tokenizer.encode(text)
+        encoding = tokenizer.encode(text.replace('`', "'"))
         record['tokens_id'] = encoding.ids
         record['sentiment'] = sentiment_hash[row.sentiment]
         record['offsets'] = encoding.offsets
