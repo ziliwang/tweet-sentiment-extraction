@@ -10,6 +10,7 @@ import click
 import random
 import numpy as np
 import os
+import re
 from tqdm import tqdm
 from copy import deepcopy
 from tokenizers import ByteLevelBPETokenizer
@@ -30,7 +31,7 @@ def preprocess(tokenizer, df):
         text = row.text
         if not text.startswith(' '): text = ' ' + text
         record = {}
-        encoding = tokenizer.encode(text)
+        encoding = tokenizer.encode(text.replace('`', "'"))
         record['tokens_id'] = encoding.ids
         record['sentiment'] = sentiment_hash[row.sentiment]
         record['offsets'] = encoding.offsets
@@ -123,22 +124,26 @@ def main(test_path, vocab, merges, models, config):
     submit['textID'] = test_df['textID']
     submit['selected_text'] = test_df['text']
     id2sentiment = dict((r.textID, r.sentiment) for _, r in test_df.iterrows())
+    filter_reg = re.compile(r'(\?|\!|\.|)\1{1,}$')
+    predicts = []
     for ids, _, offsets, texts in testiter:
         for id, offset, text in zip(ids, offsets, texts):
             if id2sentiment[id] == 'neutral':
+                predicts.append(text)
                 continue
-            start = end = None
-            for i_s in torch.argsort(starts_logits_5cv[id], descending=True):
-                if i_s > 1 and i_s < len(offset)+3:
-                    start = i_s
-                    break
-            for i_e in torch.argsort(ends_logits_5cv[id], descending=True):
-                if i_e >= start and i_e < len(offset)+3:
-                    end = i_e
-                    break
-            assert start is not None
-            assert end is not None
-            submit.selected_text[submit.textID == id] = text[offset[start-3][0]: offset[end-3][1]]
+            s_top_probs, s_top_idxs = torch.topk(starts_logits_5cv[id].softmax(-1).log(), 5)
+            e_top_probs, e_top_idxs = torch.topk(ends_logits_5cv[id].softmax(-1).log(), 5)
+            c = []
+            for _i, s_idx in enumerate(s_top_idxs):
+                if s_idx < 3: continue
+                for _j, e_idx in enumerate(e_top_idxs):
+                    if s_idx <= e_idx and e_idx -3 < len(offset):
+                        c.append((s_top_probs[_i]+e_top_probs[_j], s_idx, e_idx))
+            _, start, end = sorted(c)[-1]
+            predicts.append(filter_reg.sub(r'\1', text[offset[start-3][0]: offset[end-3][1]]))
+    submit = pd.DataFrame()
+    submit['textID'] = test_df['textID']
+    submit['selected_text'] = predicts
     submit.to_csv("submission.csv", index=False)
 
 
