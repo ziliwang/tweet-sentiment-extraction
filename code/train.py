@@ -17,7 +17,7 @@ import os
 from tqdm import tqdm
 from copy import deepcopy
 
-MAX_LEN = 200
+MAX_LEN = 100
 cls_token_id = 2
 pad_token_id = 0
 sep_token_id = 3
@@ -61,7 +61,7 @@ def train_epoch(model, optimizer, lr_scheduler, dataiter, accumulate_step):
         loss = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long(), start_positions=starts, end_positions=ends)
         cum_loss += loss.sum().detach().cpu().data.numpy()
         loss.mean().backward()
-        clip_grad_norm_(model.parameters(), 0.5)
+        clip_grad_norm_(model.parameters(), 2)
         if step % accumulate_step == 0:
             optimizer.step()
             lr_scheduler.step()
@@ -82,19 +82,16 @@ def validate_epoch(model, dataiter):
     sample_counts = 0
     with torch.no_grad():
         for inputs, _, _, offsets, texts, gts in dataiter:
-            s_top_probs, s_top_idxs, e_top_probs, e_top_idxs = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
-            batch_size = inputs.shape[0]
-            sample_counts += batch_size
-            for i in range(batch_size):
-                c = []
-                for _i, s_idx in enumerate(s_top_idxs[i]):
-                    if s_idx < 3: continue
-                    for _j, e_idx in enumerate(e_top_idxs[i]):
-                        if _j % model.end_n_top != _i: continue
-                        if s_idx <= e_idx and e_idx -3 < len(offsets[i]):
-                            c.append((s_top_probs[i][_i]+e_top_probs[i][_j], s_idx, e_idx))
-                _, start, end = sorted(c)[-1]
-                predict = texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]]
+            span_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
+            span = span_logits.max(-1)[1].cpu().numpy()  # b x idx
+            bsz, slen = inputs.shape
+            sample_counts += bsz
+            for i in range(bsz):
+                try:
+                    start, end = divmod(span[i], slen)
+                    predict = texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]]
+                except IndexError:
+                    print(span_logits[i], inputs[i], offsets[i], start, end)
                 if inputs[i][1] == 8387:
                     predict = texts[i]
                 score += jaccard(gts[i], predict)
@@ -121,16 +118,39 @@ def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_datait
     return best_score, best_model
 
 
+class TaskLayer(nn.Module):
+
+    def __init__(self, hidden_size):
+        super(TaskLayer, self).__init__()
+        self.hidden_size = hidden_size
+        self.query = nn.Linear(self.hidden_size*2, self.hidden_size)
+        self.key = nn.Linear(self.hidden_size*2, self.hidden_size)
+
+    def forward(self, hidden_states, attention_mask=None):
+        bsz, slen, hsz = hidden_states.shape
+        query = self.query(hidden_states)
+        key = self.key(hidden_states)  # b x s_len x h
+        logits = torch.matmul(query, key.transpose(-1, -2)) # b x s_len x s_len
+        logits = logits/np.sqrt(self.hidden_size)
+        if attention_mask is not None:  # 1 for available, 0 for unavailable
+            attention_mask = attention_mask[:, :, None].expand(-1, -1, slen) * attention_mask[:, None, :].expand(-1, slen, -1)
+        else:
+            attention_mask = torch.ones(bsz, slen, slen)
+            if hidden_states.is_cuda:
+                attention_mask = attention_mask.cuda()
+        attention_mask = torch.triu(attention_mask)
+        logits = logits*attention_mask - 1e6*(1-attention_mask)
+        logits = logits.view(bsz, -1)  # b x slen*slen
+        return logits
+
+
 class AlbertForQuestionAnswering(BertPreTrainedModel):
     def __init__(self, config):
         super(AlbertForQuestionAnswering, self).__init__(config)
         setattr(config, 'output_hidden_states', True)
         self.albert = AlbertModel(config)
-        self.start_logits = PoolerStartLogits(config)
-        self.end_logits = PoolerEndLogits(config)
-        self.start_n_top = 5
-        self.end_n_top = 5
-        self.dropout = nn.Dropout(0.1)
+        self.task = TaskLayer(config.hidden_size)
+        self.dropout = nn.Dropout(0.5)
         self.init_weights()
         # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
@@ -138,40 +158,17 @@ class AlbertForQuestionAnswering(BertPreTrainedModel):
         token_type_ids = torch.ones(input_ids.shape).long().cuda()
         token_type_ids[:,:3] = 0
         outputs = self.albert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-        hidden_states = self.dropout(outputs[0])
-        p_mask = 1 - attention_mask.float() * (input_ids != sep_token_id).float()
-        start_logits = self.start_logits(hidden_states, p_mask=p_mask)
-
+        hidden_states = torch.cat([outputs[0], outputs[1].unsqueeze(1).expand_as(outputs[0])], dim=-1)
+        p_mask = attention_mask.float() * (input_ids != sep_token_id).float()
+        p_mask[:,:2] = 0
+        span_logits = self.task(self.dropout(hidden_states), attention_mask=p_mask)  # b x slen*slen
+        bsz, slen = input_ids.shape
         if start_positions is not None and end_positions is not None:
-            for x in (start_positions, end_positions):
-                if x.dim() > 1:
-                    x.squeeze_(-1)
-            end_logits = self.end_logits(hidden_states, start_positions=start_positions, p_mask=p_mask)
-            start_loss = F.cross_entropy(start_logits.squeeze(-1), start_positions, reduction='none')
-            end_loss = F.cross_entropy(end_logits.squeeze(-1), end_positions, reduction='none')
-            return start_loss + end_loss
-
-        if not self.training:
-            bsz, slen, hsz = hidden_states.size()
-            start_log_probs = start_logits.softmax(-1).log()  # shape (bsz, slen)
-
-            start_top_log_probs, start_top_index = torch.topk(start_log_probs, self.start_n_top, dim=-1)  # shape (bsz, start_n_top)
-            # start_top_log_probs = start_top_log_probs - start_log_probs[:, 0:1].expand(-1, self.start_n_top)
-            start_top_index_exp = start_top_index.unsqueeze(-1).expand(-1, -1, hsz)  # shape (bsz, start_n_top, hsz)
-            start_states = torch.gather(hidden_states, -2, start_top_index_exp)  # shape (bsz, start_n_top, hsz)
-            start_states = start_states.unsqueeze(1).expand(-1, slen, -1, -1)  # shape (bsz, slen, start_n_top, hsz)
-
-            hidden_states_expanded = hidden_states.unsqueeze(2).expand_as(start_states)  # shape (bsz, slen, start_n_top, hsz)
-            p_mask = p_mask.unsqueeze(-1) if p_mask is not None else None
-            end_logits = self.end_logits(hidden_states_expanded, start_states=start_states, p_mask=p_mask)
-            end_log_probs = F.softmax(end_logits, dim=1).log()  # shape (bsz, slen, start_n_top)
-
-            end_top_log_probs, end_top_index = torch.topk(end_log_probs, self.end_n_top, dim=1)  # shape (bsz, end_n_top, start_n_top)
-            # end_top_log_probs = end_top_log_probs - end_log_probs[:, 0:1, :].expand(-1, self.end_n_top, -1)
-            end_top_log_probs = end_top_log_probs.view(-1, self.start_n_top * self.end_n_top)
-            end_top_index = end_top_index.view(-1, self.start_n_top * self.end_n_top)
-
-            return start_top_log_probs, start_top_index, end_top_log_probs, end_top_index
+            span = start_positions * slen + end_positions
+            loss = F.cross_entropy(span_logits, span, reduction='none')
+            return loss
+        else:
+            return span_logits
 
 
 @click.command()
@@ -188,7 +185,7 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
     best_models = []
     best_scores = []
     k = 0
-    for train_idx, val_idx in StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
+    for train_idx, val_idx in KFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
         k += 1
         print(f'---- {k} Fold ---')
         # train = [data[i] for i in train_idx]
@@ -199,9 +196,9 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
         optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
                             "lr": lr, 'weight_decay': 1e-2},
                            {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-                            "lr": lr, 'weight_decay': 0}])
+                            "lr": lr, 'weight_decay': 0}], betas=(0.9, 0.98), eps=1e-6)
         train_steps = np.ceil(len(train) / batch_size / accumulate_step * epoch)
-        lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1*train_steps, num_training_steps=train_steps)
+        lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.06*train_steps, num_training_steps=train_steps)
         trainiter = DataLoader(train, batch_size=batch_size, shuffle=True, collate_fn=collect_func)
         valiter = DataLoader(val, batch_size=batch_size*2, shuffle=False, collate_fn=collect_func)
         best_score, best_model = fold_train(model, optimizer, lr_scheduler, epoch, trainiter, valiter, accumulate_step)

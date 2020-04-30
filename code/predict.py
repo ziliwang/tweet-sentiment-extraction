@@ -16,7 +16,7 @@ import pandas as pd
 from itertools import accumulate
 
 
-MAX_LEN = 200
+MAX_LEN = 100
 cls_token_id = 2
 pad_token_id = 0
 sep_token_id = 3
@@ -29,7 +29,7 @@ def preprocess(tokenizer, df):
         if pd.isna(row.text): continue
         text = row.text
         text = ' ' + ' '.join(text.split())
-        tokens = tokenizer.tokenize(text)
+        tokens = tokenizer.tokenize(text.replace('`', "'"))
         offsets = list(accumulate(map(len, tokens)))
         offsets = list(zip([0] + offsets, offsets))
         record = {}
@@ -55,12 +55,38 @@ def collect_func(records):
     return ids, pad_sequence(inputs, batch_first=True, padding_value=pad_token_id).cuda(), offsets, texts
 
 
+class TaskLayer(nn.Module):
+
+    def __init__(self, hidden_size):
+        super(TaskLayer, self).__init__()
+        self.hidden_size = hidden_size
+        self.query = nn.Linear(self.hidden_size*2, self.hidden_size)
+        self.key = nn.Linear(self.hidden_size*2, self.hidden_size)
+
+    def forward(self, hidden_states, attention_mask=None):
+        bsz, slen, hsz = hidden_states.shape
+        query = self.query(hidden_states)
+        key = self.key(hidden_states)  # b x s_len x h
+        logits = torch.matmul(query, key.transpose(-1, -2)) # b x s_len x s_len
+        logits = logits/np.sqrt(self.hidden_size)
+        if attention_mask is not None:  # 1 for available, 0 for unavailable
+            attention_mask = attention_mask[:, :, None].expand(-1, -1, slen) * attention_mask[:, None, :].expand(-1, slen, -1)
+        else:
+            attention_mask = torch.ones(bsz, slen, slen)
+            if hidden_states.is_cuda:
+                attention_mask = attention_mask.cuda()
+        attention_mask = torch.triu(attention_mask)
+        logits = logits*attention_mask - 1e6*(1-attention_mask)
+        logits = logits.view(bsz, -1)  # b x slen*slen
+        return logits
+
+
 class AlbertForQuestionAnswering(BertPreTrainedModel):
     def __init__(self, config):
         super(AlbertForQuestionAnswering, self).__init__(config)
+        setattr(config, 'output_hidden_states', True)
         self.albert = AlbertModel(config)
-        # self.logits = nn.Linear(config.hidden_size*2, 2)
-        self.logits = nn.Sequential(nn.Linear(config.hidden_size*2, config.hidden_size), nn.Tanh(), nn.Linear(config.hidden_size, 2))
+        self.task = TaskLayer(config.hidden_size)
         self.dropout = nn.Dropout(0.5)
         self.init_weights()
         # torch.nn.init.normal_(self.logits.weight, std=0.02)
@@ -69,42 +95,29 @@ class AlbertForQuestionAnswering(BertPreTrainedModel):
         token_type_ids = torch.ones(input_ids.shape).long().cuda()
         token_type_ids[:,:3] = 0
         outputs = self.albert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-        hidden_states = torch.cat([outputs[0], outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
-        # hidden_states = outputs[0]
-        # start_end_logits = self.logits(self.dropout(self.bn(hidden_states.reshape(-1, hidden_states.shape[-1])).reshape_as(hidden_states)))
-        start_end_logits = self.logits(self.dropout(hidden_states))
-        start_logits, end_logits = start_end_logits.split(1, dim=-1)
-
+        hidden_states = torch.cat([outputs[0], outputs[1].unsqueeze(1).expand_as(outputs[0])], dim=-1)
+        p_mask = attention_mask.float() * (input_ids != sep_token_id).float()
+        p_mask[:,:2] = 0
+        span_logits = self.task(self.dropout(hidden_states), attention_mask=p_mask)  # b x slen*slen
+        bsz, slen = input_ids.shape
         if start_positions is not None and end_positions is not None:
-            for x in (start_positions, end_positions):
-                if x.dim() > 1:
-                    x.squeeze_(-1)
-            start_loss = F.cross_entropy(start_logits.squeeze(-1), start_positions, reduction='none')
-            end_loss = F.cross_entropy(end_logits.squeeze(-1), end_positions, reduction='none')
-            return start_loss + end_loss
-
-        if not self.training:
-            p_mask = attention_mask.float()  # 1 for available 0 for unavailable
-            p_mask[:, :3] = 0.0
-            start_logits = start_logits.squeeze(-1) * p_mask - 1e30 * (1 - p_mask)
-            end_logits = end_logits.squeeze(-1) * p_mask - 1e30 * (1- p_mask)
-            return start_logits, end_logits
+            span = start_positions * slen + end_positions
+            loss = F.cross_entropy(span_logits, span, reduction='none')
+            return loss
+        else:
+            return span_logits
 
 
-def pridect_epoch(model, dataiter, starts_logits_5cv, ends_logits_5cv):
+def pridect_epoch(model, dataiter, span_logits_bagging):
     model.eval()
     with torch.no_grad():
         for ids, inputs, _, _ in dataiter:
-            start_logits, end_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
-            for i, j, k in zip(ids, start_logits, end_logits):
-                if i in starts_logits_5cv:
-                    starts_logits_5cv[i] += j
+            span_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
+            for i, v in zip(ids, span_logits):
+                if i in span_logits_bagging:
+                    span_logits_bagging[i] += v
                 else:
-                    starts_logits_5cv[i] = j
-                if i in ends_logits_5cv:
-                    ends_logits_5cv[i] += k
-                else:
-                    ends_logits_5cv[i] = k
+                    span_logits_bagging[i] = v
 
 
 @click.command()
@@ -116,34 +129,29 @@ def main(test_path, sp_model, models, config):
     tokenizer = AlbertTokenizer(sp_model, do_lower_case=True)
     test_df = pd.read_csv(test_path)
     test = preprocess(tokenizer, test_df)
-    model_config = BertConfig.from_json_file(config)
+    model_config = AlbertConfig.from_json_file(config)
     saved_models = torch.load(models)
     model = AlbertForQuestionAnswering(model_config).cuda()
-    testiter = DataLoader(test, batch_size=32, shuffle=False, collate_fn=collect_func)
+    testiter = DataLoader(test, batch_size=64, shuffle=False, collate_fn=collect_func)
     print(f"5cv {saved_models['score']}")
-    starts_logits_5cv = {}
-    ends_logits_5cv = {}
+    span_logits_bagging = {}
     for state_dict in saved_models['models']:
         model.load_state_dict(state_dict)
-        pridect_epoch(model, testiter, starts_logits_5cv, ends_logits_5cv)
-    test = pd.read_csv(test_path)
-    submit = pd.DataFrame()
-    submit['textID'] = test['textID']
-    submit['selected_text'] = [''] * submit.shape[0]
-    for ids, _, offsets, texts in testiter:
+        pridect_epoch(model, testiter, span_logits_bagging)
+    id2sentiment = dict((r.textID, r.sentiment) for _, r in test_df.iterrows())
+    predicts = {}
+    for ids, inputs, offsets, texts in testiter:
+        bsz, slen = inputs.shape
         for id, offset, text in zip(ids, offsets, texts):
-            start = end = None
-            for i_s in torch.argsort(starts_logits_5cv[id], descending=True):
-                if i_s > 1 and i_s < len(offset)+3:
-                    start = i_s
-                    break
-            for i_e in torch.argsort(ends_logits_5cv[id], descending=True):
-                if i_e >= start and i_e < len(offset)+3:
-                    end = i_e
-                    break
-            assert start is not None
-            assert end is not None
-            submit.selected_text[submit.textID == id] = text[offset[start-3][0]: offset[end-3][1]]
+            if id2sentiment[id] == 'neutral':
+                predicts[id] = text
+                continue
+            span = span_logits_bagging[id].max(-1)[1].cpu().numpy()
+            start, end = divmod(span, slen)
+            predicts[id] = text[offset[start-3][0]: offset[end-3][1]]
+    submit = pd.DataFrame()
+    submit['textID'] = test_df['textID']
+    submit['selected_text'] = [predicts.get(r.textID, r.text) for _, r in test_df.iterrows()]
     submit.to_csv("submission.csv", index=False)
 
 

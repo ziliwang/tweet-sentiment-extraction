@@ -18,7 +18,7 @@ def annotate(tokenizer, text, selected_text):
     assert start is not None
     # start = text.find(selected_text)
     # assert start != -1
-    tokens = tokenizer.tokenize(text)
+    tokens = tokenizer.tokenize(text.replace('`', "'"))
     offsets = list(accumulate(map(len, tokens)))
     offsets = list(zip([0] + offsets, offsets))
     s_i = None
@@ -30,10 +30,10 @@ def annotate(tokenizer, text, selected_text):
     if e_i is None: e_i = i
     assert s_i is not None, (tokens, offsets)
     decode = text[offsets[s_i][0]:offsets[e_i][1]]
-    if set(decode.lower().split()) != set(selected_text.lower().split()):
-        print(f'o:{text}\ns:{selected_text}\na:{decode}')
-        print(tokens)
-        print(offsets)
+    # if set(decode.lower().split()) != set(selected_text.lower().split()):
+    #     print(f'o:{text}\ns:{selected_text}\na:{decode}')
+    #     print(tokens)
+    #     print(offsets)
     return {'text': text, 'offsets': offsets, 'tokens_id': tokenizer.convert_tokens_to_ids(tokens), 'start': s_i, 'end': e_i, 'gt': selected_text}
 
 
@@ -69,8 +69,6 @@ def main(sp_model, data_path, lower, save_path):
         decode = ann['text'][ann['offsets'][ann['start']][0]:ann['offsets'][ann['end']][1]]
         if set(decode.split()) != set(ann['gt'].split()):
             nm+=1
-        if jaccard(decode, ann['gt']) < 0.7:
-            print(f"a1:{decode}\na2:{ann['gt']}")
         score += jaccard(decode, ann['gt'])
         n+=1
     print(f'not match {nm/n}\nBest score {score/n}')
