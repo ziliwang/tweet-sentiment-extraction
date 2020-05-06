@@ -113,7 +113,8 @@ def pridect_epoch(model, dataiter, span_logits_bagging):
     with torch.no_grad():
         for ids, inputs, _, _ in dataiter:
             span_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
-            for i, v in zip(ids, span_logits):
+            span_prob = span_logits.softmax(-1)
+            for i, v in zip(ids, span_prob):
                 if i in span_logits_bagging:
                     span_logits_bagging[i] += v
                 else:
@@ -143,12 +144,22 @@ def main(test_path, sp_model, models, config):
     for ids, inputs, offsets, texts in testiter:
         bsz, slen = inputs.shape
         for id, offset, text in zip(ids, offsets, texts):
-            if id2sentiment[id] == 'neutral':
+            if id2sentiment[id] == 'neutral' and len(text.split()) == 1:
                 predicts[id] = text
                 continue
-            span = span_logits_bagging[id].max(-1)[1].cpu().numpy()
-            start, end = divmod(span, slen)
-            predicts[id] = text[offset[start-3][0]: offset[end-3][1]]
+            prob, idxs = torch.topk(span_logits_bagging[id], 2, dim=-1)
+            if prob[0]/prob[1] < 1.05:
+                predict = ''
+                for idx in idxs.cpu().numpy():
+                    start, end = divmod(idx, slen)
+                    predict += ' ' + text[offset[start-3][0]: offset[end-3][1]]
+            else:
+                start, end = divmod(idxs[0].cpu().numpy(), slen)
+                predict = text[offset[start-3][0]: offset[end-3][1]]
+            # span = span_logits_bagging[id].max(-1)[1].cpu().numpy()
+            # start, end = divmod(span, slen)
+            # predicts[id] = text[offset[start-3][0]: offset[end-3][1]]
+            predicts[id] = predict
     submit = pd.DataFrame()
     submit['textID'] = test_df['textID']
     submit['selected_text'] = [predicts.get(r.textID, r.text) for _, r in test_df.iterrows()]

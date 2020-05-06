@@ -1,7 +1,7 @@
 import torch
 from torch import nn, optim
 from torch.nn import functional as F
-from transformers import AlbertTokenizer, AlbertModel, AdamW, BertPreTrainedModel, get_linear_schedule_with_warmup
+from transformers import AlbertTokenizer, AlbertModel, AdamW, BertPreTrainedModel, get_linear_schedule_with_warmup, get_constant_schedule_with_warmup
 from transformers.modeling_utils import PoolerAnswerClass, PoolerEndLogits, PoolerStartLogits
 from transformers.modeling_albert import *
 from torch.utils.data import DataLoader
@@ -34,6 +34,36 @@ def collect_func(records):
         inputs.append(torch.LongTensor([cls_token_id, rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
         starts.append(rec['start']+3)
         ends.append(rec['end']+3)
+        offsets.append(rec['offsets'])
+        texts.append(rec['text'])
+        gts.append(rec['gt'])
+    return pad_sequence(inputs, batch_first=True, padding_value=pad_token_id).cuda(), torch.LongTensor(starts).cuda(), torch.LongTensor(ends).cuda(), \
+        offsets, texts, gts
+
+
+def collect_func1(records):
+    inputs = []
+    starts = []
+    ends = []
+    offsets = []
+    texts = []
+    gts = []
+    for rec in records:
+        inputs.append(torch.LongTensor([cls_token_id, rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
+        s = rec['start']
+        e = rec['end']
+        if rec['sentiment'] != 8387 and len(rec['offsets']) > 1 and random.random() < 0.05:
+            if random.random() > 0.5:
+                s = min(len(rec['offsets'])-1, s+1, e)
+            else:
+                s = max(0, s-1)
+        if rec['sentiment'] != 8387 and len(rec['offsets']) > 1 and random.random() < 0.05:
+            if random.random() > 0.5:
+                e = max(0, s, e-1)
+            else:
+                e = min(len(rec['offsets'])-1, e+1)
+        starts.append(s+3)
+        ends.append(e+3)
         offsets.append(rec['offsets'])
         texts.append(rec['text'])
         gts.append(rec['gt'])
@@ -83,18 +113,28 @@ def validate_epoch(model, dataiter):
     with torch.no_grad():
         for inputs, _, _, offsets, texts, gts in dataiter:
             span_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
-            span = span_logits.max(-1)[1].cpu().numpy()  # b x idx
+            # span = span_logits.max(-1)[1].cpu().numpy()  # b x idx
+            probs, spans = torch.topk(span_logits.softmax(-1), k=2, dim=-1)
+            spans = spans.cpu().numpy()
             bsz, slen = inputs.shape
             sample_counts += bsz
             for i in range(bsz):
-                try:
-                    start, end = divmod(span[i], slen)
-                    predict = texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]]
-                except IndexError:
-                    print(span_logits[i], inputs[i], offsets[i], start, end)
-                if inputs[i][1] == 8387:
-                    predict = texts[i]
-                score += jaccard(gts[i], predict)
+                if inputs[i][1] == 8387 or len(texts[i].split()) == 1:
+                    predict = [(texts[i], 1.0)]
+                else:
+                    predict = []
+                    for j in range(2):
+                        try:
+                            start, end = divmod(spans[i][j], slen)
+                            predict.append((texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]], probs[i][j]))
+                        except IndexError:
+                            # predict = texts[i]
+                            print(span_logits[i], inputs[i], offsets[i], start, end)
+                if len(predict) == 2 and predict[0][1] / predict[1][1] < 1.05:
+                    predict[0] = (predict[0][0] + ' ' + predict[1][0], 1.0)
+                # if jaccard(gts[i], predict[0][0]) < 0.5 and len(predict) > 1:
+                #     print(f'gt: {gts[i]}\np1: {predict[0]} p2: {predict[1]}')
+                score += jaccard(gts[i], predict[0][0])
     return score/sample_counts
 
 
@@ -150,7 +190,7 @@ class AlbertForQuestionAnswering(BertPreTrainedModel):
         setattr(config, 'output_hidden_states', True)
         self.albert = AlbertModel(config)
         self.task = TaskLayer(config.hidden_size)
-        self.dropout = nn.Dropout(0.5)
+        self.dropout = nn.Dropout(0.8)
         self.init_weights()
         # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
@@ -188,8 +228,8 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
     for train_idx, val_idx in KFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
         k += 1
         print(f'---- {k} Fold ---')
-        # train = [data[i] for i in train_idx]
-        train = [data[i] for i in train_idx if data[i]['sentiment'] != 8387]
+        train = [data[i] for i in train_idx]
+        # train = [data[i] for i in train_idx if data[i]['sentiment'] != 8387]
         val = [data[i] for i in val_idx]
         model = AlbertForQuestionAnswering.from_pretrained(pretrained).cuda()
         no_decay = ['.bias', 'full_layer_layer_norm.weight', 'LayerNorm.weight', ]
@@ -199,6 +239,7 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
                             "lr": lr, 'weight_decay': 0}], betas=(0.9, 0.98), eps=1e-6)
         train_steps = np.ceil(len(train) / batch_size / accumulate_step * epoch)
         lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.06*train_steps, num_training_steps=train_steps)
+        # lr_scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=0.06*train_steps)
         trainiter = DataLoader(train, batch_size=batch_size, shuffle=True, collate_fn=collect_func)
         valiter = DataLoader(val, batch_size=batch_size*2, shuffle=False, collate_fn=collect_func)
         best_score, best_model = fold_train(model, optimizer, lr_scheduler, epoch, trainiter, valiter, accumulate_step)
