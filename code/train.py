@@ -158,39 +158,12 @@ def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_datait
     return best_score, best_model
 
 
-class TaskLayer(nn.Module):
-
-    def __init__(self, hidden_size):
-        super(TaskLayer, self).__init__()
-        self.hidden_size = hidden_size
-        self.query = nn.Linear(self.hidden_size*2, self.hidden_size)
-        self.key = nn.Linear(self.hidden_size*2, self.hidden_size)
-
-    def forward(self, hidden_states, attention_mask=None):
-        bsz, slen, hsz = hidden_states.shape
-        query = self.query(hidden_states)
-        key = self.key(hidden_states)  # b x s_len x h
-        logits = torch.matmul(query, key.transpose(-1, -2)) # b x s_len x s_len
-        logits = logits/np.sqrt(self.hidden_size)
-        if attention_mask is not None:  # 1 for available, 0 for unavailable
-            attention_mask = attention_mask[:, :, None].expand(-1, -1, slen) * attention_mask[:, None, :].expand(-1, slen, -1)
-        else:
-            attention_mask = torch.ones(bsz, slen, slen)
-            if hidden_states.is_cuda:
-                attention_mask = attention_mask.cuda()
-        attention_mask = torch.triu(attention_mask)
-        logits = logits*attention_mask - 1e6*(1-attention_mask)
-        logits = logits.view(bsz, -1)  # b x slen*slen
-        return logits
-
-
 class AlbertForQuestionAnswering(BertPreTrainedModel):
     def __init__(self, config):
         super(AlbertForQuestionAnswering, self).__init__(config)
-        setattr(config, 'output_hidden_states', True)
         self.albert = AlbertModel(config)
-        self.task = TaskLayer(config.hidden_size)
-        self.dropout = nn.Dropout(0.8)
+        self.logits = nn.Linear(config.hidden_size, 2)
+        self.dropout = nn.Dropout(0.2)
         self.init_weights()
         # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
@@ -198,7 +171,7 @@ class AlbertForQuestionAnswering(BertPreTrainedModel):
         token_type_ids = torch.ones(input_ids.shape).long().cuda()
         token_type_ids[:,:3] = 0
         outputs = self.albert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-        hidden_states = torch.cat([outputs[0], outputs[1].unsqueeze(1).expand_as(outputs[0])], dim=-1)
+        hidden_states = self.dropout(outputs[0])
         p_mask = attention_mask.float() * (input_ids != sep_token_id).float()
         p_mask[:,:2] = 0
         span_logits = self.task(self.dropout(hidden_states), attention_mask=p_mask)  # b x slen*slen
