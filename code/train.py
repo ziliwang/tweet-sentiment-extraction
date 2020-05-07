@@ -14,7 +14,7 @@ import os
 from tqdm import tqdm
 from copy import deepcopy
 
-MAX_LEN = 200
+MAX_LEN = 100
 cls_token_id = 0
 pad_token_id = 1
 sep_token_id = 2
@@ -129,9 +129,9 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
         super(RobertaForQuestionAnswering, self).__init__(config)
         setattr(config, 'output_hidden_states', True)
         self.roberta = RobertaModel(config)
-        self.logits = nn.Linear(config.hidden_size*2, 2)
+        self.logits = nn.Linear(config.hidden_size, 2)
         # self.logits = nn.Sequential(nn.Linear(config.hidden_size*2, config.hidden_size), nn.Tanh(), nn.Linear(config.hidden_size, 2))
-        self.dropout = nn.Dropout(0.5)
+        self.dropout = nn.Dropout(0.2)
         # nn.init.xavier_uniform_(self.logits.weight)
         self.init_weights()
         # torch.nn.init.normal_(self.logits.weight, std=0.02)
@@ -142,8 +142,8 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
         # hidden_states = torch.stack(outputs[-1][-6:], dim=-1).max(-1)[0]
         # hidden_states = torch.cat([torch.stack(outputs[-1][-4:], dim=-1).mean(-1), outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
         # hidden_states = torch.cat([torch.cat(outputs[-1][-4:], dim=-1), outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
-        hidden_states = torch.cat([outputs[0], outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
-        # hidden_states = outputs[0]
+        # hidden_states = torch.cat([outputs[0], outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
+        hidden_states = self.dropout(outputs[0])
         # start_end_logits = self.logits(self.dropout(self.bn(hidden_states.reshape(-1, hidden_states.shape[-1])).reshape_as(hidden_states)))
         start_end_logits = self.logits(self.dropout(hidden_states))
         start_logits, end_logits = start_end_logits.split(1, dim=-1)
@@ -157,7 +157,7 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
             return start_loss + end_loss
 
         if not self.training:
-            p_mask = attention_mask.float()  # 1 for available 0 for unavailable
+            p_mask = attention_mask.float() * (input_ids != sep_token_id).float()  # 1 for available 0 for unavailable
             p_mask[:, :3] = 0.0
             start_logits = start_logits.squeeze(-1) * p_mask - 1e30 * (1 - p_mask)
             end_logits = end_logits.squeeze(-1) * p_mask - 1e30 * (1- p_mask)
@@ -168,7 +168,7 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
 @click.option('--data', default='roberta.input.joblib')
 @click.option('--pretrained', default='../model/roberta-l12/')
 @click.option('--lr', default=5e-5)
-@click.option('--batch-size', default=32)
+@click.option('--batch-size', default=64)
 @click.option('--epoch', default=3)
 @click.option('--accumulate-step', default=1)
 @click.option('--seed', default=9895)
@@ -178,12 +178,12 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
     best_models = []
     best_scores = []
     k = 0
-    for train_idx, val_idx in StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
+    for train_idx, val_idx in StratifiedKFold(n_splits=5, random_state=100).split(data, [i['sentiment'] for i in data]):
         k += 1
         print(f'---- {k} Fold ---')
-        train = [data[i] for i in train_idx if data[i]['sentiment'] != 7974]
-        # train = [data[i] for i in train_idx]
-        val = [data[i] for i in val_idx]
+        # train = [data[i] for i in train_idx if data[i]['sentiment'] != 7974 and data[i]['note_score']==1.0]
+        train = [data[i] for i in train_idx if data[i]['note_score']==1.0]
+        val = [data[i] for i in train_idx]
         model = RobertaForQuestionAnswering.from_pretrained(pretrained).cuda()
         no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
         optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
