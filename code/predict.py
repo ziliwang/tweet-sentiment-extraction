@@ -16,7 +16,7 @@ from tokenizers import ByteLevelBPETokenizer
 import pandas as pd
 
 
-MAX_LEN = 200
+MAX_LEN = 100
 cls_token_id = 0
 pad_token_id = 1
 sep_token_id = 2
@@ -30,7 +30,7 @@ def preprocess(tokenizer, df):
         text = row.text
         if not text.startswith(' '): text = ' ' + text
         record = {}
-        encoding = tokenizer.encode(text)
+        encoding = tokenizer.encode(text.replace('`', "'"))
         record['tokens_id'] = encoding.ids
         record['sentiment'] = sentiment_hash[row.sentiment]
         record['offsets'] = encoding.offsets
@@ -53,51 +53,69 @@ def collect_func(records):
     return ids, pad_sequence(inputs, batch_first=True, padding_value=pad_token_id).cuda(), offsets, texts
 
 
-class RobertaForQuestionAnswering(BertPreTrainedModel):
+class TaskLayer(nn.Module):
+
+    def __init__(self, hidden_size):
+        super(TaskLayer, self).__init__()
+        self.hidden_size = hidden_size
+        self.query = nn.Linear(self.hidden_size, self.hidden_size)
+        self.key = nn.Linear(self.hidden_size, self.hidden_size)
+
+    def forward(self, hidden_states, attention_mask=None):
+        bsz, slen, hsz = hidden_states.shape
+        query = self.query(hidden_states)
+        key = self.key(hidden_states)  # b x s_len x h
+        logits = torch.matmul(query, key.transpose(-1, -2)) # b x s_len x s_len
+        logits = logits/np.sqrt(self.hidden_size)
+        if attention_mask is not None:  # 1 for available, 0 for unavailable
+            attention_mask = attention_mask[:, :, None].expand(-1, -1, slen) * attention_mask[:, None, :].expand(-1, slen, -1)
+        else:
+            attention_mask = torch.ones(bsz, slen, slen)
+            if hidden_states.is_cuda:
+                attention_mask = attention_mask.cuda()
+        attention_mask = torch.triu(attention_mask)
+        logits = logits*attention_mask - 1e6*(1-attention_mask)
+        logits = logits.view(bsz, -1)  # b x slen*slen
+        return logits
+
+
+class TweetSentiment(BertPreTrainedModel):
     def __init__(self, config):
-        super(RobertaForQuestionAnswering, self).__init__(config)
+        super(TweetSentiment, self).__init__(config)
+        # setattr(config, 'output_hidden_states', True)
         self.roberta = RobertaModel(config)
-        self.logits = nn.Linear(config.hidden_size*2, 2)
-        self.dropout = nn.Dropout(0.5)
+        self.task = TaskLayer(config.hidden_size)
+        self.dropout = nn.Dropout(0.2)
         self.init_weights()
+        # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
     def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
         outputs = self.roberta(input_ids, attention_mask=attention_mask)
-        hidden_states = torch.cat([outputs[0], outputs[1][:,None,:].expand_as(outputs[0])], dim=-1)
-        start_end_logits = self.logits(self.dropout(hidden_states))
-        start_logits, end_logits = start_end_logits.split(1, dim=-1)
-
+        # hidden_states = torch.cat([outputs[0], outputs[1].unsqueeze(1).expand_as(outputs[0])], dim=-1)
+        hidden_states = outputs[0]
+        p_mask = attention_mask.float() * (input_ids != sep_token_id).float()
+        p_mask[:,:2] = 0
+        span_logits = self.task(self.dropout(hidden_states), attention_mask=p_mask)  # b x slen*slen
+        bsz, slen = input_ids.shape
         if start_positions is not None and end_positions is not None:
-            for x in (start_positions, end_positions):
-                if x.dim() > 1:
-                    x.squeeze_(-1)
-            start_loss = F.cross_entropy(start_logits.squeeze(-1), start_positions, reduction='none')
-            end_loss = F.cross_entropy(end_logits.squeeze(-1), end_positions, reduction='none')
-            return start_loss + end_loss
-
-        if not self.training:
-            p_mask = attention_mask.float()  # 1 for available 0 for unavailable
-            p_mask[:, :3] = 0.0
-            start_logits = start_logits.squeeze(-1) * p_mask - 1e30 * (1 - p_mask)
-            end_logits = end_logits.squeeze(-1) * p_mask - 1e30 * (1- p_mask)
-            return start_logits, end_logits
+            span = start_positions * slen + end_positions
+            loss = F.cross_entropy(span_logits, span, reduction='none')
+            return loss
+        else:
+            return span_logits
 
 
-def pridect_epoch(model, dataiter, starts_logits_5cv, ends_logits_5cv):
+def pridect_epoch(model, dataiter, span_logits_bagging):
     model.eval()
     with torch.no_grad():
         for ids, inputs, _, _ in dataiter:
-            start_logits, end_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
-            for i, j, k in zip(ids, start_logits, end_logits):
-                if i in starts_logits_5cv:
-                    starts_logits_5cv[i] += j
+            span_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
+            span_prob = span_logits.softmax(-1)
+            for i, v in zip(ids, span_prob):
+                if i in span_logits_bagging:
+                    span_logits_bagging[i] += v
                 else:
-                    starts_logits_5cv[i] = j
-                if i in ends_logits_5cv:
-                    ends_logits_5cv[i] += k
-                else:
-                    ends_logits_5cv[i] = k
-
+                    span_logits_bagging[i] = v
 
 @click.command()
 @click.option('--test-path', default='../input/test.csv')
@@ -109,36 +127,39 @@ def main(test_path, vocab, merges, models, config):
     tokenizer = ByteLevelBPETokenizer(vocab, merges, lowercase=True, add_prefix_space=True)
     test_df = pd.read_csv(test_path)
     test = preprocess(tokenizer, test_df)
-    model_config = BertConfig.from_json_file(config)
+    model_config = RobertaConfig.from_json_file(config)
     saved_models = torch.load(models)
-    model = RobertaForQuestionAnswering(model_config).cuda()
+    model = TweetSentiment(model_config).cuda()
     testiter = DataLoader(test, batch_size=32, shuffle=False, collate_fn=collect_func)
     print(f"5cv {saved_models['score']}")
-    starts_logits_5cv = {}
-    ends_logits_5cv = {}
+    span_logits_bagging = {}
     for state_dict in saved_models['models']:
         model.load_state_dict(state_dict)
-        pridect_epoch(model, testiter, starts_logits_5cv, ends_logits_5cv)
+        pridect_epoch(model, testiter, span_logits_bagging)
+    id2sentiment = dict((r.textID, r.sentiment) for _, r in test_df.iterrows())
+    predicts = {}
+    for ids, inputs, offsets, texts in testiter:
+        bsz, slen = inputs.shape
+        for id, offset, text in zip(ids, offsets, texts):
+            if id2sentiment[id] == 'neutral' and len(text.split()) == 1:
+                predicts[id] = text
+                continue
+            prob, idxs = torch.topk(span_logits_bagging[id], 2, dim=-1)
+            if prob[0]/prob[1] < 1.05:
+                predict = ''
+                for idx in idxs.cpu().numpy():
+                    start, end = divmod(idx, slen)
+                    predict += ' ' + text[offset[start-3][0]: offset[end-3][1]]
+            else:
+                start, end = divmod(idxs[0].cpu().numpy(), slen)
+                predict = text[offset[start-3][0]: offset[end-3][1]]
+            # span = span_logits_bagging[id].max(-1)[1].cpu().numpy()
+            # start, end = divmod(span, slen)
+            # predicts[id] = text[offset[start-3][0]: offset[end-3][1]]
+            predicts[id] = predict
     submit = pd.DataFrame()
     submit['textID'] = test_df['textID']
-    submit['selected_text'] = test_df['text']
-    id2sentiment = dict((r.textID, r.sentiment) for _, r in test_df.iterrows())
-    for ids, _, offsets, texts in testiter:
-        for id, offset, text in zip(ids, offsets, texts):
-            if id2sentiment[id] == 'neutral':
-                continue
-            start = end = None
-            for i_s in torch.argsort(starts_logits_5cv[id], descending=True):
-                if i_s > 1 and i_s < len(offset)+3:
-                    start = i_s
-                    break
-            for i_e in torch.argsort(ends_logits_5cv[id], descending=True):
-                if i_e >= start and i_e < len(offset)+3:
-                    end = i_e
-                    break
-            assert start is not None
-            assert end is not None
-            submit.selected_text[submit.textID == id] = text[offset[start-3][0]: offset[end-3][1]]
+    submit['selected_text'] = [predicts.get(r.textID, r.text) for _, r in test_df.iterrows()]
     submit.to_csv("submission.csv", index=False)
 
 
