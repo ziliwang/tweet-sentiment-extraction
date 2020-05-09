@@ -66,7 +66,7 @@ def train_epoch(model, optimizer, lr_scheduler, dataiter, accumulate_step):
         loss.mean().backward()
         # cum_loss += loss.detach().cpu().data.numpy()
         # loss.backward()
-        clip_grad_norm_(model.parameters(), 2)
+        # clip_grad_norm_(model.parameters(), 2)
         if step % accumulate_step == 0:
             optimizer.step()
             lr_scheduler.step()
