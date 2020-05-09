@@ -225,9 +225,9 @@ class TweetSentiment(BertPreTrainedModel):
         span_logits = self.task(self.dropout(hidden_states), attention_mask=p_mask)  # b x slen*slen
         bsz, slen = input_ids.shape
         if start_positions is not None and end_positions is not None:
-            # span = start_positions * slen + end_positions
-            # loss = F.cross_entropy(span_logits, span, reduction='none')
-            loss = loss_func(span_logits.softmax(-1), start_positions, end_positions, position_mask=p_mask)
+            span = start_positions * slen + end_positions
+            loss = F.cross_entropy(span_logits, span, reduction='none')
+            # loss = loss_func(span_logits.softmax(-1), start_positions, end_positions, position_mask=p_mask)
             return loss
         else:
             return span_logits
@@ -252,8 +252,8 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
         print(f'---- {k} Fold ---')
         # train = [data[i] for i in train_idx if data[i]['sentiment'] != neutral_token_id]
         # train = [data[i] for i in train_idx if not data[i]['bad']]
-        train = [data[i] for i in train_idx if data[i]['score'] > 0.5 and data[i]['sentiment'] != neutral_token_id]
-        # train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
+        # train = [data[i] for i in train_idx if data[i]['score'] > 0.5 and data[i]['sentiment'] != neutral_token_id]
+        train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
         val = [data[i] for i in val_idx]
         print(f"val best score is {np.mean([i['score'] for i in val])}")
         model = TweetSentiment.from_pretrained(pretrained).cuda()
