@@ -20,6 +20,7 @@ MAX_LEN = 200
 cls_token_id = 0
 pad_token_id = 1
 sep_token_id = 2
+neutral_token_id = 7974
 
 
 def collect_func(records):
@@ -266,7 +267,9 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
     for train_idx, val_idx in StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
         k += 1
         print(f'---- {k} Fold ---')
-        train = [data[i] for i in train_idx if data[i]['sentiment'] != 7974]
+        # train = [data[i] for i in train_idx if data[i]['sentiment'] != 7974]
+        # train = [data[i] for i in train_idx if data[i]['score'] > 0.5 and data[i]['sentiment'] != neutral_token_id]
+        train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
         # train = [data[i] for i in train_idx]
         val = [data[i] for i in val_idx]
         model = RobertaForQuestionAnswering1.from_pretrained(pretrained).cuda()
