@@ -73,7 +73,7 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
         p_mask = 1 - attention_mask.float() * (input_ids != sep_token_id).float()
         p_mask[:,:2] = 1.0
         start_logits = self.start_logits(hidden_states, p_mask=p_mask)
-        return start_logits
+        return start_logits.softmax(-1)
         #
         # if not self.training:
         #     bsz, slen, hsz = hidden_states.size()
@@ -97,13 +97,14 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
         #
         #     return start_top_log_probs, start_top_index, end_top_log_probs, end_top_index
 
-    def inference_end(self, input_ids, attention_mask, start_logits):
+    def inference_end(self, input_ids, attention_mask, start_probs):
         outputs = self.roberta(input_ids, attention_mask=attention_mask)
         hidden_states = outputs[0]
         p_mask = 1 - attention_mask.float() * (input_ids != sep_token_id).float()
         p_mask[:,:2] = 1.0
         bsz, slen, hsz = hidden_states.size()
-        start_log_probs = start_logits.softmax(-1).log()  # shape (bsz, slen)
+        # start_log_probs = start_logits.softmax(-1).log()  # shape (bsz, slen)
+        start_log_probs = start_probs.log()
         start_top_log_probs, start_top_index = torch.topk(start_log_probs, self.start_n_top, dim=-1)  # shape (bsz, start_n_top)
         start_top_index_exp = start_top_index.unsqueeze(-1).expand(-1, -1, hsz)
         start_states = torch.gather(hidden_states, -2, start_top_index_exp)  # shape (bsz, start_n_top, hsz)
@@ -113,7 +114,7 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
         p_mask = p_mask.unsqueeze(-1) if p_mask is not None else None
         end_logits = self.end_logits(hidden_states_expanded, start_states=start_states, p_mask=p_mask)
 
-        return end_logits
+        return end_logits.softmax(1)
 
 
 def inference_start(model, dataiter, bagging_start_logits):
@@ -132,8 +133,8 @@ def inference_end(model, dataiter, bagging_start_logits, bagging_end_logits):
     model.eval()
     with torch.no_grad():
         for ids, inputs, _, _ in dataiter:
-            start_logits = torch.stack([bagging_start_logits[i] for i in ids])  # bsz, start_n_top
-            end_logits = model.inference_end(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long(), start_logits=start_logits)
+            start_logits = torch.stack([bagging_start_logits[i] for i in ids])/5  # bsz, start_n_top
+            end_logits = model.inference_end(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long(), start_probs=start_logits)
             for i, logits in zip(ids, end_logits):
                 if i in bagging_end_logits:
                     bagging_end_logits[i] += logits
@@ -177,9 +178,11 @@ def main(test_path, vocab, merges, models, config):
                 continue
             start_logits = bagging_start_logits[id]
             end_logits = bagging_end_logits[id]
-            start_log_probs = start_logits.softmax(-1).log()  # slen
+            # start_log_probs = start_logits.softmax(-1).log()  # slen
+            start_log_probs = (0.2*start_logits).log()
             start_top_log_probs, start_top_index = torch.topk(start_log_probs, model.start_n_top, dim=-1)  # shape (start_n_top)
-            end_log_probs = F.softmax(end_logits, dim=0).log()  # shape (slen, start_n_top)
+            # end_log_probs = F.softmax(end_logits, dim=0).log()  # shape (slen, start_n_top)
+            end_log_probs = (0.2*end_logits).log()
             end_top_log_probs, end_top_index = torch.topk(end_log_probs, model.end_n_top, dim=0)  # shape (end_n_top, start_n_top)
             c = []
             for _i, s_idx in enumerate(start_top_index):
