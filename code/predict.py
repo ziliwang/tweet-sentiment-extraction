@@ -58,8 +58,9 @@ class TaskLayer(nn.Module):
     def __init__(self, hidden_size):
         super(TaskLayer, self).__init__()
         self.hidden_size = hidden_size
+        self.query = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size), nn.Tanh(), nn.Linear(self.hidden_size, self.hidden_size))
         self.query = nn.Linear(self.hidden_size, self.hidden_size)
-        self.key = nn.Linear(self.hidden_size, self.hidden_size)
+        self.key = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size), nn.Tanh(), nn.Linear(self.hidden_size, self.hidden_size))
 
     def forward(self, hidden_states, attention_mask=None):
         bsz, slen, hsz = hidden_states.shape

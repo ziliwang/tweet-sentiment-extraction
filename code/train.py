@@ -185,7 +185,9 @@ class TaskLayer(nn.Module):
     def __init__(self, hidden_size):
         super(TaskLayer, self).__init__()
         self.hidden_size = hidden_size
+        # self.query = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size), nn.Tanh(), nn.Linear(self.hidden_size, self.hidden_size))
         self.query = nn.Linear(self.hidden_size, self.hidden_size)
+        # self.key = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size), nn.Tanh(), nn.Linear(self.hidden_size, self.hidden_size))
         self.key = nn.Linear(self.hidden_size, self.hidden_size)
 
     def forward(self, hidden_states, attention_mask=None):
@@ -254,6 +256,7 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
         # train = [data[i] for i in train_idx if not data[i]['bad']]
         # train = [data[i] for i in train_idx if data[i]['score'] > 0.5 and data[i]['sentiment'] != neutral_token_id]
         train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
+        # train = [data[i] for i in train_idx]
         val = [data[i] for i in val_idx]
         print(f"val best score is {np.mean([i['score'] for i in val])}")
         model = TweetSentiment.from_pretrained(pretrained).cuda()
