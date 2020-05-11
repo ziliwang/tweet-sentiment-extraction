@@ -58,9 +58,10 @@ class TaskLayer(nn.Module):
     def __init__(self, hidden_size):
         super(TaskLayer, self).__init__()
         self.hidden_size = hidden_size
-        self.query = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size), nn.Tanh(), nn.Linear(self.hidden_size, self.hidden_size))
+        # self.query = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size), nn.Tanh(), nn.Linear(self.hidden_size, self.hidden_size))
         self.query = nn.Linear(self.hidden_size, self.hidden_size)
-        self.key = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size), nn.Tanh(), nn.Linear(self.hidden_size, self.hidden_size))
+        # self.key = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size), nn.Tanh(), nn.Linear(self.hidden_size, self.hidden_size))
+        self.key = nn.Linear(self.hidden_size, self.hidden_size)
 
     def forward(self, hidden_states, attention_mask=None):
         bsz, slen, hsz = hidden_states.shape
@@ -142,22 +143,22 @@ def main(test_path, vocab, merges, models, config):
     for ids, inputs, offsets, texts in testiter:
         bsz, slen = inputs.shape
         for id, offset, text in zip(ids, offsets, texts):
-            if id2sentiment[id] == 'neutral' and len(text.split()) == 1:
-                predicts[id] = text
-                continue
-            prob, idxs = torch.topk(span_logits_bagging[id], 2, dim=-1)
-            if prob[0]/prob[1] < 1.05:
-                predict = ''
-                for idx in idxs.cpu().numpy():
-                    start, end = divmod(idx, slen)
-                    predict += ' ' + text[offset[start-3][0]: offset[end-3][1]]
-            else:
-                start, end = divmod(idxs[0].cpu().numpy(), slen)
-                predict = text[offset[start-3][0]: offset[end-3][1]]
-            # span = span_logits_bagging[id].max(-1)[1].cpu().numpy()
-            # start, end = divmod(span, slen)
-            # predicts[id] = text[offset[start-3][0]: offset[end-3][1]]
-            predicts[id] = predict
+            # if id2sentiment[id] == 'neutral' and len(text.split()) == 1:
+            #     predicts[id] = text
+            #     continue
+            # prob, idxs = torch.topk(span_logits_bagging[id], 2, dim=-1)
+            # if prob[0]/prob[1] < 1.05:
+            #     predict = ''
+            #     for idx in idxs.cpu().numpy():
+            #         start, end = divmod(idx, slen)
+            #         predict += ' ' + text[offset[start-3][0]: offset[end-3][1]]
+            # else:
+            #     start, end = divmod(idxs[0].cpu().numpy(), slen)
+            #     predict = text[offset[start-3][0]: offset[end-3][1]]
+            span = span_logits_bagging[id].max(-1)[1].cpu().numpy()
+            start, end = divmod(span, slen)
+            predicts[id] = text[offset[start-3][0]: offset[end-3][1]]
+            # predicts[id] = predict
     submit = pd.DataFrame()
     submit['textID'] = test_df['textID']
     submit['selected_text'] = [predicts.get(r.textID, r.text) for _, r in test_df.iterrows()]
