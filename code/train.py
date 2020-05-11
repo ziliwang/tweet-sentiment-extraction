@@ -89,28 +89,32 @@ def validate_epoch(model, dataiter):
     with torch.no_grad():
         for inputs, _, _, offsets, texts, gts in dataiter:
             span_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
-            # span = span_logits.max(-1)[1].cpu().numpy()  # b x idx
-            probs, spans = torch.topk(span_logits.softmax(-1), k=2, dim=-1)
-            spans = spans.cpu().numpy()
+            span = span_logits.max(-1)[1].cpu().numpy()  # b x idx
+            # probs, spans = torch.topk(span_logits.softmax(-1), k=2, dim=-1)
+            # spans = spans.cpu().numpy()
             bsz, slen = inputs.shape
             sample_counts += bsz
-            for i in range(bsz):
-                if inputs[i][1] == neutral_token_id or len(texts[i].split()) == 1:
-                    predict = [(texts[i], 1.0)]
-                else:
-                    predict = []
-                    for j in range(2):
-                        try:
-                            start, end = divmod(spans[i][j], slen)
-                            predict.append((texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]], probs[i][j]))
-                        except IndexError:
-                            # predict = texts[i]
-                            print(span_logits[i], inputs[i], offsets[i], start, end)
-                if len(predict) == 2 and predict[0][1] / predict[1][1] < 1.05:
-                    predict[0] = (predict[0][0] + ' ' + predict[1][0], 1.0)
+            # for i in range(bsz):
+            #     if inputs[i][1] == neutral_token_id or len(texts[i].split()) == 1:
+            #         predict = [(texts[i], 1.0)]
+            #     else:
+            #         predict = []
+            #         for j in range(2):
+            #             try:
+            #                 start, end = divmod(spans[i][j], slen)
+            #                 predict.append((texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]], probs[i][j]))
+            #             except IndexError:
+            #                 # predict = texts[i]
+            #                 print(span_logits[i], inputs[i], offsets[i], start, end)
+            #     if len(predict) == 2 and predict[0][1] / predict[1][1] < 1.05:
+            #         predict[0] = (predict[0][0] + ' ' + predict[1][0], 1.0)
                 # if jaccard(gts[i], predict[0][0]) < 0.5 and len(predict) > 1:
                 #     print(f'gt: {gts[i]}\np1: {predict[0]} p2: {predict[1]}')
-                score += jaccard(gts[i], predict[0][0])
+                # score += jaccard(gts[i], predict[0][0])
+            for gt, p, text, offset in zip(gts, span, texts, offsets):
+                start, end = divmod(p, slen)
+                predict = text[offset[start-3][0]: offset[end-3][1]]
+                score += jaccard(gt, predict)
     return score/sample_counts
 
 
