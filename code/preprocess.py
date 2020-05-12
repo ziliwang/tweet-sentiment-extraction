@@ -5,36 +5,73 @@ import click
 import os
 import numpy as np
 from itertools import accumulate
+import re
 
 
 def annotate(tokenizer, text, selected_text):
     text = ' ' + ' '.join(text.split())
-    selected = ' ' + ' '.join(selected_text.split())
+    selected = ' '.join(selected_text.split())
 
-    start = None
-    for i, v in enumerate(text):
-        if v == selected[1] and text[i:i+len(selected)-1] == selected[1:]:
-            start = i
-    assert start is not None
-    # start = text.find(selected_text)
-    # assert start != -1
+    start = text.find(selected)
+    # for i, v in enumerate(text):
+    #     if v == selected[1] and text[i:i+len(selected)-1] == selected[1:]:
+    #         start = i
+    if start == -1:
+        print(f'{text}\n{select}')
+        raise ValueError
+    end = start+len(selected)
+    if text[start-1] == ' ':
+        start = start -1
+    else:  # constraint the start is space, without this constraint parsing score 0.974, and add this 0.972
+        new_start = start
+        for i in range(1, len(text)):
+            if start+i < len(text):
+                if text[start+i] == ' ':
+                    new_start = start + i
+                    break
+            if start - i >= 0:
+                if text[start-i] == ' ':
+                    new_start = start - i
+                    break
+                if re.match(r'\W$', text[start-i], re.I):
+                    new_start = start - i + 1
+                    break
+        if start != new_start:
+            start = new_start
+            # print(f't: {text}\ns: {selected_text}\no: {text[start:end]}\nc: {text[new_start:end]}\n')
     tokens = tokenizer.tokenize(text.replace('`', "'"))
+    split_in_head = [1 if i.startswith('▁') or re.match(r'\W+$', i, re.I) else 0 for i in tokens]
     offsets = list(accumulate(map(len, tokens)))
     offsets = list(zip([0] + offsets, offsets))
+    bad_ann = False
     s_i = None
     e_i = None
     for i, (m, n) in enumerate(offsets):
         if s_i is None and n > start: s_i = i
-        if e_i is None and n >= start + len(selected)-1: e_i = i
+        if e_i is None and n >= end: e_i = i
         # if e_i is None and n >= idx1: e_i = i
-    if e_i is None: e_i = i
-    assert s_i is not None, (tokens, offsets)
+    if e_i is None: e_i = len(offsets) -1
+    if offsets[e_i][1] > end:  # shrink end
+        i = e_i
+        while i > 1 and not split_in_head[i]:
+            i -= 1
+        e_i = i - 1
+    # e_i = max(s_i, e_i)
+    if e_i < s_i:  # shrink end failed
+        i = s_i + 1
+        while i < len(offsets) and not split_in_head[i]:
+            i += 1
+        e_i = i - 1
+        bad_ann = True
     decode = text[offsets[s_i][0]:offsets[e_i][1]]
     # if set(decode.lower().split()) != set(selected_text.lower().split()):
     #     print(f'o:{text}\ns:{selected_text}\na:{decode}')
     #     print(tokens)
     #     print(offsets)
-    return {'text': text, 'offsets': offsets, 'tokens_id': tokenizer.convert_tokens_to_ids(tokens), 'start': s_i, 'end': e_i, 'gt': selected_text}
+    #     print(start, end, s_i, e_i)
+    return {'text': text, 'offsets': offsets, 'tokens_id': tokenizer.convert_tokens_to_ids(tokens),
+            'start': s_i, 'end': e_i, 'gt': selected_text,
+            'score': jaccard(decode, selected_text), 'bad': bad_ann}
 
 
 def jaccard(str1, str2):
@@ -52,6 +89,7 @@ def jaccard(str1, str2):
 def main(sp_model, data_path, lower, save_path):
     tokenizer = AlbertTokenizer(sp_model, do_lower_case=lower)
     sentiment_hash = dict(zip(['positive', 'negative', 'neutral'], tokenizer.convert_tokens_to_ids(['▁positive', '▁negative', '▁neutral'])))
+    print(sentiment_hash)
     train = pd.read_csv(os.path.join(data_path, 'train.csv'))
     dataset = []
     n = nm = 0

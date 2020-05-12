@@ -21,6 +21,7 @@ MAX_LEN = 100
 cls_token_id = 2
 pad_token_id = 0
 sep_token_id = 3
+task_id = {'positive': 2221, 'negative': 3682, 'neutral': 8387}
 
 
 def collect_func(records):
@@ -34,36 +35,6 @@ def collect_func(records):
         inputs.append(torch.LongTensor([cls_token_id, rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
         starts.append(rec['start']+3)
         ends.append(rec['end']+3)
-        offsets.append(rec['offsets'])
-        texts.append(rec['text'])
-        gts.append(rec['gt'])
-    return pad_sequence(inputs, batch_first=True, padding_value=pad_token_id).cuda(), torch.LongTensor(starts).cuda(), torch.LongTensor(ends).cuda(), \
-        offsets, texts, gts
-
-
-def collect_func1(records):
-    inputs = []
-    starts = []
-    ends = []
-    offsets = []
-    texts = []
-    gts = []
-    for rec in records:
-        inputs.append(torch.LongTensor([cls_token_id, rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
-        s = rec['start']
-        e = rec['end']
-        if rec['sentiment'] != 8387 and len(rec['offsets']) > 1 and random.random() < 0.05:
-            if random.random() > 0.5:
-                s = min(len(rec['offsets'])-1, s+1, e)
-            else:
-                s = max(0, s-1)
-        if rec['sentiment'] != 8387 and len(rec['offsets']) > 1 and random.random() < 0.05:
-            if random.random() > 0.5:
-                e = max(0, s, e-1)
-            else:
-                e = min(len(rec['offsets'])-1, e+1)
-        starts.append(s+3)
-        ends.append(e+3)
         offsets.append(rec['offsets'])
         texts.append(rec['text'])
         gts.append(rec['gt'])
@@ -113,28 +84,16 @@ def validate_epoch(model, dataiter):
     with torch.no_grad():
         for inputs, _, _, offsets, texts, gts in dataiter:
             span_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
-            # span = span_logits.max(-1)[1].cpu().numpy()  # b x idx
-            probs, spans = torch.topk(span_logits.softmax(-1), k=2, dim=-1)
-            spans = spans.cpu().numpy()
+            span = span_logits.max(-1)[1].cpu().numpy()  # b x idx
             bsz, slen = inputs.shape
             sample_counts += bsz
-            for i in range(bsz):
-                if inputs[i][1] == 8387 or len(texts[i].split()) == 1:
-                    predict = [(texts[i], 1.0)]
+            for gt, p, text, offset, tokens in zip(gts, span, texts, offsets, inputs):
+                if tokens[1] == task_id['neutral']:
+                    predict = text
                 else:
-                    predict = []
-                    for j in range(2):
-                        try:
-                            start, end = divmod(spans[i][j], slen)
-                            predict.append((texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]], probs[i][j]))
-                        except IndexError:
-                            # predict = texts[i]
-                            print(span_logits[i], inputs[i], offsets[i], start, end)
-                if len(predict) == 2 and predict[0][1] / predict[1][1] < 1.05:
-                    predict[0] = (predict[0][0] + ' ' + predict[1][0], 1.0)
-                # if jaccard(gts[i], predict[0][0]) < 0.5 and len(predict) > 1:
-                #     print(f'gt: {gts[i]}\np1: {predict[0]} p2: {predict[1]}')
-                score += jaccard(gts[i], predict[0][0])
+                    start, end = divmod(p, slen)
+                    predict = text[offset[start-3][0]: offset[end-3][1]]
+                score += jaccard(gt, predict)
     return score/sample_counts
 
 
@@ -158,12 +117,40 @@ def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_datait
     return best_score, best_model
 
 
+class TaskLayer(nn.Module):
+
+    def __init__(self, hidden_size):
+        super(TaskLayer, self).__init__()
+        self.hidden_size = hidden_size
+        # self.query = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size), nn.Tanh(), nn.Linear(self.hidden_size, self.hidden_size))
+        self.query = nn.Linear(self.hidden_size, self.hidden_size)
+        # self.key = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size), nn.Tanh(), nn.Linear(self.hidden_size, self.hidden_size))
+        self.key = nn.Linear(self.hidden_size, self.hidden_size)
+
+    def forward(self, hidden_states, attention_mask=None):
+        bsz, slen, hsz = hidden_states.shape
+        query = self.query(hidden_states)
+        key = self.key(hidden_states)  # b x s_len x h
+        logits = torch.matmul(query, key.transpose(-1, -2)) # b x s_len x s_len
+        logits = logits/np.sqrt(self.hidden_size)
+        if attention_mask is not None:  # 1 for available, 0 for unavailable
+            attention_mask = attention_mask[:, :, None].expand(-1, -1, slen) * attention_mask[:, None, :].expand(-1, slen, -1)
+        else:
+            attention_mask = torch.ones(bsz, slen, slen)
+            if hidden_states.is_cuda:
+                attention_mask = attention_mask.cuda()
+        attention_mask = torch.triu(attention_mask)
+        logits = logits*attention_mask - 1e6*(1-attention_mask)
+        logits = logits.view(bsz, -1)  # b x slen*slen
+        return logits
+
+
 class AlbertForQuestionAnswering(BertPreTrainedModel):
     def __init__(self, config):
         super(AlbertForQuestionAnswering, self).__init__(config)
         self.albert = AlbertModel(config)
-        self.logits = nn.Linear(config.hidden_size, 2)
-        self.dropout = nn.Dropout(0.2)
+        self.task = TaskLayer(config.hidden_size)
+        self.dropout = nn.Dropout(0.1)
         self.init_weights()
         # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
@@ -185,7 +172,7 @@ class AlbertForQuestionAnswering(BertPreTrainedModel):
 
 
 @click.command()
-@click.option('--data', default='albert.input.joblib')
+@click.option('--data', default='alberta.input.joblib')
 @click.option('--pretrained', default='../model/albert.base/')
 @click.option('--lr', default=5e-5)
 @click.option('--batch-size', default=32)
@@ -198,11 +185,12 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
     best_models = []
     best_scores = []
     k = 0
-    for train_idx, val_idx in KFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
+    for train_idx, val_idx in StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
         k += 1
         print(f'---- {k} Fold ---')
-        train = [data[i] for i in train_idx]
-        # train = [data[i] for i in train_idx if data[i]['sentiment'] != 8387]
+        # train = [data[i] for i in train_idx]
+        train = [data[i] for i in train_idx if data[i]['score'] > 0.5 and data[i]['sentiment'] != task_id['neutral']]
+        # train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
         val = [data[i] for i in val_idx]
         model = AlbertForQuestionAnswering.from_pretrained(pretrained).cuda()
         no_decay = ['.bias', 'full_layer_layer_norm.weight', 'LayerNorm.weight', ]
