@@ -15,15 +15,11 @@ from tqdm import tqdm
 from copy import deepcopy
 
 MAX_LEN = 100
-cls_token_id = 0
-pad_token_id = 1
-sep_token_id = 2
-positive_token_id = 1313
-negative_token_id = 2430
-neutral_token_id = 7974
+cls_token_id = 1
+pad_token_id = 2
+sep_token_id = 1
 
-# epoch 5 lr 3e-5 seed  cv 7149 7089,7192,7184,7111,7171
-# ratio: 0.3 or 0.2, loss kl_div pytorch, train set > 0.5 and remove neutral
+task_id_map = {'positive': 2258, 'negative': 3683, 'neutral': 8323}
 
 
 def collect_func(records):
@@ -111,9 +107,12 @@ def validate_epoch(model, dataiter):
                 # if jaccard(gts[i], predict[0][0]) < 0.5 and len(predict) > 1:
                 #     print(f'gt: {gts[i]}\np1: {predict[0]} p2: {predict[1]}')
                 # score += jaccard(gts[i], predict[0][0])
-            for gt, p, text, offset in zip(gts, span, texts, offsets):
-                start, end = divmod(p, slen)
-                predict = text[offset[start-3][0]: offset[end-3][1]]
+            for gt, p, text, offset, tokens in zip(gts, span, texts, offsets, inputs):
+                if tokens[1] == task_id_map['neutral']:
+                    predict = text
+                else:
+                    start, end = divmod(p, slen)
+                    predict = text[offset[start-3][0]: offset[end-3][1]]
                 score += jaccard(gt, predict)
     return score/sample_counts
 
@@ -212,18 +211,21 @@ class TaskLayer(nn.Module):
         return logits
 
 
-class TweetSentiment(BertPreTrainedModel):
+class TweetSentiment(XLMPreTrainedModel):
     def __init__(self, config):
         super(TweetSentiment, self).__init__(config)
         # setattr(config, 'output_hidden_states', True)
-        self.roberta = RobertaModel(config)
+        self.xlm = XLMModel(config)
         self.task = TaskLayer(config.hidden_size)
         self.dropout = nn.Dropout(0.1)
         self.init_weights()
         # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
     def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
-        outputs = self.roberta(input_ids, attention_mask=attention_mask)
+        # lang = torch.zeros(input_ids.shape).long().cuda()
+        # token_type_ids = torch.ones(input_ids.shape).long().cuda()
+        # token_type_ids[:,:3] = 0
+        outputs = self.xlm(input_ids, attention_mask=attention_mask) #, token_type_ids=token_type_ids)
         # hidden_states = torch.cat([outputs[0], outputs[1].unsqueeze(1).expand_as(outputs[0])], dim=-1)
         hidden_states = outputs[0]
         p_mask = attention_mask.float() * (input_ids != sep_token_id).float()
@@ -240,8 +242,8 @@ class TweetSentiment(BertPreTrainedModel):
 
 
 @click.command()
-@click.option('--data', default='roberta.input.joblib')
-@click.option('--pretrained', default='../model/roberta-l12/')
+@click.option('--data', default='xlm.input.joblib')
+@click.option('--pretrained', default='../model/xlm/')
 @click.option('--lr', default=5e-5)
 @click.option('--batch-size', default=32)
 @click.option('--epoch', default=3)
@@ -259,12 +261,12 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
         # train = [data[i] for i in train_idx if data[i]['sentiment'] != neutral_token_id]
         # train = [data[i] for i in train_idx if not data[i]['bad']]
         # train = [data[i] for i in train_idx if data[i]['score'] > 0.5 and data[i]['sentiment'] != neutral_token_id]
-        train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
+        train = [data[i] for i in train_idx if data[i]['score'] > 0.7]
         # train = [data[i] for i in train_idx]
         val = [data[i] for i in val_idx]
         print(f"val best score is {np.mean([i['score'] for i in val])}")
         model = TweetSentiment.from_pretrained(pretrained).cuda()
-        no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        no_decay = ['.bias', 'layer_norm']
         optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
                             "lr": lr, 'weight_decay': 1e-2},
                            {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
