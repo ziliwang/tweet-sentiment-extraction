@@ -111,9 +111,12 @@ def validate_epoch(model, dataiter):
                 # if jaccard(gts[i], predict[0][0]) < 0.5 and len(predict) > 1:
                 #     print(f'gt: {gts[i]}\np1: {predict[0]} p2: {predict[1]}')
                 # score += jaccard(gts[i], predict[0][0])
-            for gt, p, text, offset in zip(gts, span, texts, offsets):
-                start, end = divmod(p, slen)
-                predict = text[offset[start-3][0]: offset[end-3][1]]
+            for gt, p, text, offset, inp in zip(gts, span, texts, offsets, inputs):
+                if inp[1] == neutral_token_id:
+                    predict = text
+                else:
+                    start, end = divmod(p, slen)
+                    predict = text[offset[start-3][0]: offset[end-3][1]]
                 score += jaccard(gt, predict)
     return score/sample_counts
 
@@ -242,12 +245,13 @@ class TweetSentiment(BertPreTrainedModel):
 @click.command()
 @click.option('--data', default='roberta.input.joblib')
 @click.option('--pretrained', default='../model/roberta-l12/')
-@click.option('--lr', default=5e-5)
+@click.option('--lr', default=3e-5)
 @click.option('--batch-size', default=32)
-@click.option('--epoch', default=3)
+@click.option('--epoch', default=4)
 @click.option('--accumulate-step', default=1)
 @click.option('--seed', default=9895)
-def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
+@click.option('--data-augmentation', is_flag=True, default=False)
+def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, data_augmentation):
     seed_everything(seed)
     data = joblib.load(data)
     best_models = []
@@ -259,8 +263,25 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
         # train = [data[i] for i in train_idx if data[i]['sentiment'] != neutral_token_id]
         # train = [data[i] for i in train_idx if not data[i]['bad']]
         # train = [data[i] for i in train_idx if data[i]['score'] > 0.5 and data[i]['sentiment'] != neutral_token_id]
-        train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
-        # train = [data[i] for i in train_idx]
+        # train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
+        if data_augmentation:
+            print('using data augmentation')
+            train = [data[i] for i in train_idx if data[i]['score'] > 0.5 and data[i]['sentiment'] != neutral_token_id]
+            ext = []
+            for _i in train:
+                ext.append({
+                    'sentiment': _i['sentiment'],
+                    'offsets': _i['offsets'],
+                    'text': _i['text'],
+                    'gt': _i['gt'],
+                    'tokens_id': _i['tokens_id'][::-1],
+                    'start': len(_i['tokens_id']) - 1 - _i['end'],
+                    'end': len(_i['tokens_id']) - 1 - _i['start']
+                })
+            train = [data[i] for i in train_idx]
+            train = train + ext
+        else:
+            train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
         val = [data[i] for i in val_idx]
         print(f"val best score is {np.mean([i['score'] for i in val])}")
         model = TweetSentiment.from_pretrained(pretrained).cuda()
@@ -277,7 +298,7 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
         best_scores.append(best_score)
         best_models.append(best_model)
     print(f'final cv {np.mean(best_scores)}')
-    torch.save({'models': best_models, 'score': np.mean(best_scores)}, 'trained.models')
+    torch.save({'models': best_models, 'score': np.mean(best_scores), 'scores': best_scores}, 'trained.models')
 
 
 if __name__ == '__main__':
