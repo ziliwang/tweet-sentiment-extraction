@@ -112,11 +112,11 @@ def validate_epoch(model, dataiter):
                 #     print(f'gt: {gts[i]}\np1: {predict[0]} p2: {predict[1]}')
                 # score += jaccard(gts[i], predict[0][0])
             for gt, p, text, offset, inp in zip(gts, span, texts, offsets, inputs):
-                if inp[1] == neutral_token_id:
-                    predict = text
-                else:
+                predict = text
+                if inp[1] != neutral_token_id:
                     start, end = divmod(p, slen)
-                    predict = text[offset[start-3][0]: offset[end-3][1]]
+                    if start -3 >= 0 and start -3 < len(offset) and end -3 >= 0 and end - 3 < len(offset):
+                        predict = text[offset[start-3][0]: offset[end-3][1]]
                 score += jaccard(gt, predict)
     return score/sample_counts
 
@@ -242,6 +242,43 @@ class TweetSentiment(BertPreTrainedModel):
             return span_logits
 
 
+class TweetSentiment1(BertPreTrainedModel):
+    def __init__(self, config):
+        super(TweetSentiment1, self).__init__(config)
+        # setattr(config, 'output_hidden_states', True)
+        self.roberta = RobertaModel(config)
+        self.task1 = TaskLayer(128+128+128)
+        # self.task2 = TaskLayer(config.hidden_size)
+        self.dropout = nn.Dropout(0.1)
+        self.conv1 = nn.Conv2d(1, 128, kernel_size=(1, config.hidden_size))
+        self.conv2 = nn.Conv2d(1, 128, kernel_size=(3, config.hidden_size), padding=(1, 0))
+        self.conv3 = nn.Conv2d(1, 128, kernel_size=(5, config.hidden_size), padding=(2, 0))
+        self.layernorm = nn.LayerNorm(256+256+128)
+        self.init_weights()
+        # torch.nn.init.normal_(self.logits.weight, std=0.02)
+
+    def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
+        outputs = self.roberta(input_ids, attention_mask=attention_mask)
+        # hidden_states = torch.cat([outputs[0], outputs[1].unsqueeze(1).expand_as(outputs[0])], dim=-1)
+        hidden_states = outputs[0]
+        bsz, slen, hdz = hidden_states.shape
+        x1 = self.conv1(hidden_states[:, None, :, :]).squeeze(-1).transpose(-1, -2)
+        x2 = self.conv2(hidden_states[:, None, :, :]).squeeze(-1).transpose(-1, -2)
+        x3 = self.conv3(hidden_states[:, None, :, :]).squeeze(-1).transpose(-1, -2)
+        x = torch.cat([x1, x2, x3], dim=-1)
+        # start_logits, end_logits = self.task2(x).split(1, dim=-1)
+        p_mask = attention_mask.float() * (input_ids != sep_token_id).float()
+        p_mask[:, :2] = 0
+        span_logits = self.task1(self.dropout(x), attention_mask=p_mask)  # b x slen*slen
+        if start_positions is not None and end_positions is not None:
+            span = start_positions * slen + end_positions
+            loss = F.cross_entropy(span_logits, span, reduction='none')
+            # loss = loss_func(span_logits.softmax(-1), start_positions, end_positions, position_mask=p_mask)
+            return loss
+        else:
+            return span_logits
+
+
 @click.command()
 @click.option('--data', default='roberta.input.joblib')
 @click.option('--pretrained', default='../model/roberta-l12/')
@@ -278,13 +315,12 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, data_au
                     'start': len(_i['tokens_id']) - 1 - _i['end'],
                     'end': len(_i['tokens_id']) - 1 - _i['start']
                 })
-            train = [data[i] for i in train_idx]
             train = train + ext
         else:
             train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
         val = [data[i] for i in val_idx]
         print(f"val best score is {np.mean([i['score'] for i in val])}")
-        model = TweetSentiment.from_pretrained(pretrained).cuda()
+        model = TweetSentiment1.from_pretrained(pretrained).cuda()
         no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
         optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
                             "lr": lr, 'weight_decay': 1e-2},
