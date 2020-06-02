@@ -223,14 +223,13 @@ class TweetSentiment(BertPreTrainedModel):
         self.task = TaskLayer(config.hidden_size)
         self.dropout = nn.Dropout(0.1)
         self.init_weights()
-        # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
     def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
         outputs = self.roberta(input_ids, attention_mask=attention_mask)
         # hidden_states = torch.cat([outputs[0], outputs[1].unsqueeze(1).expand_as(outputs[0])], dim=-1)
         hidden_states = outputs[0]
         p_mask = attention_mask.float() * (input_ids != sep_token_id).float()
-        p_mask[:,:2] = 0
+        p_mask[:, :2] = 0
         span_logits = self.task(self.dropout(hidden_states), attention_mask=p_mask)  # b x slen*slen
         bsz, slen = input_ids.shape
         if start_positions is not None and end_positions is not None:
@@ -279,6 +278,16 @@ class TweetSentiment1(BertPreTrainedModel):
             return span_logits
 
 
+def lr_decay_adamw(model, rank_layers, no_weight_decay_layers, lr, decay_rate=0.97, **argv):
+    layers_para_no_weight_decay = [[p for n, p in model.named_parameters() if layer in n and any(no_wd in n for no_wd in no_weight_decay_layers)]
+                                   for layer in rank_layers]
+    layers_para_with_weight_decay = [[p for n, p in model.named_parameters() if layer in n and not any(no_wd in n for no_wd in no_weight_decay_layers)]
+                                     for layer in rank_layers]
+    optimizer = AdamW([{'params': ps, 'lr': lr*(decay_rate**idx), 'weight_decay': .0} for idx, ps in enumerate(layers_para_no_weight_decay[::-1])] +
+                      [{'params': ps, 'lr': lr*(decay_rate**idx)} for idx, ps in enumerate(layers_para_with_weight_decay)], **argv)
+    return optimizer
+
+
 @click.command()
 @click.option('--data', default='roberta.input.joblib')
 @click.option('--pretrained', default='../model/roberta-l12/')
@@ -296,6 +305,8 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, data_au
     k = 0
     for train_idx, val_idx in KFold(n_splits=5, random_state=seed).split(data):  # StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
         k += 1
+        # if k in [1, 3]:
+        #     continue
         print(f'---- {k} Fold ---')
         # train = [data[i] for i in train_idx if data[i]['sentiment'] != neutral_token_id]
         # train = [data[i] for i in train_idx if not data[i]['bad']]
@@ -303,7 +314,7 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, data_au
         # train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
         if data_augmentation:
             print('using data augmentation')
-            train = [data[i] for i in train_idx if data[i]['score'] > 0.5 and data[i]['sentiment'] != neutral_token_id]
+            train = [data[i] for i in train_idx if data[i]['score'] > 0.7 and data[i]['sentiment'] != neutral_token_id]
             ext = []
             for _i in train:
                 ext.append({
@@ -317,15 +328,18 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, data_au
                 })
             train = train + ext
         else:
-            train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
+            train = [data[i] for i in train_idx if data[i]['score'] > 0.7]
         val = [data[i] for i in val_idx]
         print(f"val best score is {np.mean([i['score'] for i in val])}")
-        model = TweetSentiment1.from_pretrained(pretrained).cuda()
+        model = TweetSentiment.from_pretrained(pretrained).cuda()
         no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
-        optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-                            "lr": lr, 'weight_decay': 1e-2},
-                           {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-                            "lr": lr, 'weight_decay': 0}], betas=(0.9, 0.98), eps=1e-6)
+        # optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+        #                     "lr": lr, 'weight_decay': 1e-2},
+        #                    {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+        #                     "lr": lr, 'weight_decay': 0}], betas=(0.9, 0.98), eps=1e-6)
+        # optimizer = AdamW(model.parameters(), weight_decay=1e-2, lr=lr, eps=1e-6)
+        layers_group = ['roberta.embeddings.'] + [f'roberta.encoder.layer.{i}.' for i in range(12)] + ['task.']
+        optimizer = lr_decay_adamw(model, rank_layers=layers_group, no_weight_decay_layers=no_decay, lr=lr, eps=1e-6, weight_decay=1e-2)
         train_steps = np.ceil(len(train) / batch_size / accumulate_step * epoch)
         lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1*train_steps, num_training_steps=train_steps)
         trainiter = DataLoader(train, batch_size=batch_size, shuffle=True, collate_fn=collect_func)
