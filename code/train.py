@@ -296,8 +296,10 @@ def lr_decay_adamw(model, rank_layers, no_weight_decay_layers, lr, decay_rate=0.
 @click.option('--epoch', default=4)
 @click.option('--accumulate-step', default=1)
 @click.option('--seed', default=9895)
-@click.option('--data-augmentation', is_flag=True, default=False)
-def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, data_augmentation):
+@click.option('--lr-decay-rate', default=1.0)
+@click.option('--beta1', default=0.9)
+@click.option('--beta2', default=0.98)
+def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, lr_decay_rate, beta1, beta2):
     seed_everything(seed)
     data = joblib.load(data)
     best_models = []
@@ -312,23 +314,7 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, data_au
         # train = [data[i] for i in train_idx if not data[i]['bad']]
         # train = [data[i] for i in train_idx if data[i]['score'] > 0.5 and data[i]['sentiment'] != neutral_token_id]
         # train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
-        if data_augmentation:
-            print('using data augmentation')
-            train = [data[i] for i in train_idx if data[i]['score'] > 0.7 and data[i]['sentiment'] != neutral_token_id]
-            ext = []
-            for _i in train:
-                ext.append({
-                    'sentiment': _i['sentiment'],
-                    'offsets': _i['offsets'],
-                    'text': _i['text'],
-                    'gt': _i['gt'],
-                    'tokens_id': _i['tokens_id'][::-1],
-                    'start': len(_i['tokens_id']) - 1 - _i['end'],
-                    'end': len(_i['tokens_id']) - 1 - _i['start']
-                })
-            train = train + ext
-        else:
-            train = [data[i] for i in train_idx if data[i]['score'] > 0.7]
+        train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
         val = [data[i] for i in val_idx]
         print(f"val best score is {np.mean([i['score'] for i in val])}")
         model = TweetSentiment.from_pretrained(pretrained).cuda()
@@ -339,7 +325,8 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, data_au
         #                     "lr": lr, 'weight_decay': 0}], betas=(0.9, 0.98), eps=1e-6)
         # optimizer = AdamW(model.parameters(), weight_decay=1e-2, lr=lr, eps=1e-6)
         layers_group = ['roberta.embeddings.'] + [f'roberta.encoder.layer.{i}.' for i in range(12)] + ['task.']
-        optimizer = lr_decay_adamw(model, rank_layers=layers_group, no_weight_decay_layers=no_decay, lr=lr, eps=1e-6, weight_decay=1e-2)
+        optimizer = lr_decay_adamw(model, rank_layers=layers_group, no_weight_decay_layers=no_decay,
+                                       decay_rate=lr_decay_rate, lr=lr, eps=1e-6, weight_decay=1e-2, betas=(beta1, beta2))
         train_steps = np.ceil(len(train) / batch_size / accumulate_step * epoch)
         lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1*train_steps, num_training_steps=train_steps)
         trainiter = DataLoader(train, batch_size=batch_size, shuffle=True, collate_fn=collect_func)
