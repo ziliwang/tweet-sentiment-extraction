@@ -321,7 +321,7 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, lr_deca
         # train = [data[i] for i in train_idx if not data[i]['bad']]
         # train = [data[i] for i in train_idx if data[i]['score'] > 0.5 and data[i]['sentiment'] != neutral_token_id]
         # train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
-        train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
+        train = [data[i] for i in train_idx if data[i]['score'] == 1.0 and data[i]['sentiment'] != neutral_token_id]
         val = [data[i] for i in val_idx]
         print(f"val best score is {np.mean([i['score'] for i in val])}")
         if model_type == 'c':
