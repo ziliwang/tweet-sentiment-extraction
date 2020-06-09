@@ -141,7 +141,7 @@ def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_datait
     return best_score, best_model
 
 
-def loose_dist(start, end, slen, alpha=0.2, threshold=1e-6, min_size=2):
+def loose_dist(start, end, slen, alpha=0.3, threshold=1e-6, min_size=2):
     start_loose = torch.zeros(slen)
     end_loose = torch.zeros(slen)
     start_loose[start] = 1
@@ -179,6 +179,7 @@ def loss_func(predicts, start_positions, end_positions, position_mask):
     start_dist = start_dist*position_mask
     end_dist = end_dist*position_mask
     dist = start_dist[:, :, None].expand(-1, -1, slen) * end_dist[:, None, :].expand(-1, slen, -1)
+    dist = torch.triu(dist)
     dist = dist.view(bsz, -1)
     # dist = dist.view(bsz, -1) + 1e-6
     predicts = predicts + 1e-6
@@ -212,7 +213,7 @@ class TaskLayer(nn.Module):
         attention_mask = torch.triu(attention_mask)
         logits = logits*attention_mask - 1e6*(1-attention_mask)
         logits = logits.view(bsz, -1)  # b x slen*slen
-        return logits
+        return logits, attention_mask.view(bsz, -1)
 
 
 class TweetSentiment(BertPreTrainedModel):
@@ -230,20 +231,25 @@ class TweetSentiment(BertPreTrainedModel):
         hidden_states = outputs[0]
         p_mask = attention_mask.float() * (input_ids != sep_token_id).float()
         p_mask[:, :2] = 0
-        span_logits = self.task(self.dropout(hidden_states), attention_mask=p_mask)  # b x slen*slen
+        span_logits, _ = self.task(self.dropout(hidden_states), attention_mask=p_mask)  # b x slen*slen
+        # span_logits, p_mask = self.task(self.dropout(hidden_states), attention_mask=p_mask)
         bsz, slen = input_ids.shape
         if start_positions is not None and end_positions is not None:
             span = start_positions * slen + end_positions
             loss = F.cross_entropy(span_logits, span, reduction='none')
-            # loss = loss_func(span_logits.softmax(-1), start_positions, end_positions, position_mask=p_mask)
+            # alpha = 0.1
+            # smooth_loss = loss_func(span_logits.softmax(-1), start_positions, end_positions, position_mask=p_mask)
+            # smooth_prob = (1 / p_mask.sum(-1)).unsqueeze(-1).expand_as(p_mask) * p_mask
+            # smooth_loss = -(span_logits.log_softmax(-1) * smooth_prob).sum(-1)
+            # return (1-alpha)*loss + alpha*smooth_loss
             return loss
         else:
             return span_logits
 
 
-class TweetSentiment1(BertPreTrainedModel):
+class TweetSentiment_C(BertPreTrainedModel):
     def __init__(self, config):
-        super(TweetSentiment1, self).__init__(config)
+        super(TweetSentiment_C, self).__init__(config)
         # setattr(config, 'output_hidden_states', True)
         self.roberta = RobertaModel(config)
         self.task1 = TaskLayer(128+128+128)
@@ -299,13 +305,14 @@ def lr_decay_adamw(model, rank_layers, no_weight_decay_layers, lr, decay_rate=0.
 @click.option('--lr-decay-rate', default=1.0)
 @click.option('--beta1', default=0.9)
 @click.option('--beta2', default=0.98)
-def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, lr_decay_rate, beta1, beta2):
+@click.option('--model-type', default='default')
+def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, lr_decay_rate, beta1, beta2, model_type):
     seed_everything(seed)
     data = joblib.load(data)
     best_models = []
     best_scores = []
     k = 0
-    for train_idx, val_idx in KFold(n_splits=5, random_state=seed).split(data):  # StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
+    for train_idx, val_idx in KFold(n_splits=5, random_state=9895).split(data):  # StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
         k += 1
         # if k in [1, 3]:
         #     continue
@@ -317,7 +324,10 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, lr_deca
         train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
         val = [data[i] for i in val_idx]
         print(f"val best score is {np.mean([i['score'] for i in val])}")
-        model = TweetSentiment.from_pretrained(pretrained).cuda()
+        if model_type == 'c':
+            model = TweetSentiment_C.from_pretrained(pretrained).cuda()
+        else:
+            model = TweetSentiment.from_pretrained(pretrained).cuda()
         no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
         # optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
         #                     "lr": lr, 'weight_decay': 1e-2},
@@ -335,7 +345,7 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, lr_deca
         best_scores.append(best_score)
         best_models.append(best_model)
     print(f'final cv {np.mean(best_scores)}')
-    torch.save({'models': best_models, 'score': np.mean(best_scores), 'scores': best_scores}, 'trained.models')
+    torch.save({'type': model_type, 'models': best_models, 'score': np.mean(best_scores), 'scores': best_scores}, 'trained.models')
 
 
 if __name__ == '__main__':
