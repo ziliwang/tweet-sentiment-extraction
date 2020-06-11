@@ -78,29 +78,21 @@ def validate_epoch(model, dataiter):
     score = 0
     sample_counts = 0
     with torch.no_grad():
-        for inputs, _, _, offsets, texts, gts in dataiter:
+        for inputs, gt_s, gt_e, offsets, texts, gts in dataiter:
             start_logits, end_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
-            _, start_top5 = torch.topk(start_logits, 20)
-            _, end_top5 = torch.topk(end_logits, 20)
+            start_probs = start_logits.softmax(-1)
+            end_probs = end_logits.softmax(-1)
+            # start_probs = torch.avg_pool1d(start_logits[:, None, :], kernel_size=3, stride=1, padding=1, count_include_pad=False).squeeze(1)
+            # end_probs = torch.avg_pool1d(end_logits[:, None, :], kernel_size=3, stride=1, padding=1, count_include_pad=False).squeeze(1)
             batch_size = inputs.shape[0]
             sample_counts += batch_size
-            for i in range(batch_size):
-                start = None
-                for i_s in start_top5[i]:
-                    if i_s > 1 and i_s < len(offsets[i])+3:
-                        start = i_s
-                        break
-                end = None
-                for i_e in end_top5[i]:
-                    if i_e >= i_s and i_e < len(offsets[i])+3:
-                        end = i_e
-                        break
-                assert start is not None
-                assert end is not None
-                predict = texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]]
-                if inputs[i][1] == 7974:
-                    predict = texts[i]
-                score += jaccard(gts[i], predict)
+            s_idxs = start_probs.max(-1)[1]
+            e_idxs = end_probs.max(-1)[1]
+            for inp, text, gt, offset, s, e in zip(inputs, texts, gts, offsets, s_idxs, e_idxs):
+                predict = text
+                if inp[1] != 7974 and s <= e and s - 3 >= 0 and s-3 < len(offset) and e-3 < len(offset):
+                    predict = text[offset[s-3][0]:offset[e-3][1]]
+                score += jaccard(gt, predict)
     return score/sample_counts
 
 
@@ -167,9 +159,9 @@ class RobertaForQuestionAnswering(BertPreTrainedModel):
 @click.command()
 @click.option('--data', default='roberta.input.joblib')
 @click.option('--pretrained', default='../model/roberta-l12/')
-@click.option('--lr', default=5e-5)
-@click.option('--batch-size', default=64)
-@click.option('--epoch', default=3)
+@click.option('--lr', default=3e-5)
+@click.option('--batch-size', default=32)
+@click.option('--epoch', default=4)
 @click.option('--accumulate-step', default=1)
 @click.option('--seed', default=9895)
 def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
@@ -182,8 +174,8 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed):
         k += 1
         print(f'---- {k} Fold ---')
         # train = [data[i] for i in train_idx if data[i]['sentiment'] != 7974 and data[i]['note_score']==1.0]
-        train = [data[i] for i in train_idx if data[i]['note_score']==1.0]
-        val = [data[i] for i in train_idx]
+        train = [data[i] for i in train_idx if data[i]['score']>0.5]
+        val = [data[i] for i in val_idx]
         model = RobertaForQuestionAnswering.from_pretrained(pretrained).cuda()
         no_decay = ['.bias', 'LayerNorm.bias', 'LayerNorm.weight']
         optimizer = AdamW([{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
