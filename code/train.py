@@ -26,6 +26,33 @@ neutral_token_id = 7974
 # ratio: 0.3 or 0.2, loss kl_div pytorch, train set > 0.5 and remove neutral
 
 
+def collect_func0(records):
+    inputs = []
+    starts = []
+    ends = []
+    offsets = []
+    texts = []
+    gts = []
+    for rec in records:
+        inputs.append(torch.LongTensor([cls_token_id, rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
+        if 'start' in rec:
+            starts.append(rec['start']+3)
+            ends.append(rec['end']+3)
+            gts.append(rec['gt'])
+        elif rec['sentiment'] == neutral_token_id:
+            starts.append(3)
+            ends.append(3+len(rec['tokens_id'][:MAX_LEN])-1)
+            gts.append('')
+        else:
+            starts.append(0)
+            ends.append(0)
+            gts.append('')
+        offsets.append(rec['offsets'])
+        texts.append(rec['text'])
+    return pad_sequence(inputs, batch_first=True, padding_value=pad_token_id).cuda(), torch.LongTensor(starts).cuda(), torch.LongTensor(ends).cuda(), \
+        offsets, texts, gts
+
+
 def collect_func(records):
     inputs = []
     starts = []
@@ -53,15 +80,34 @@ def seed_everything(seed: int):
     torch.backends.cudnn.deterministic = True
 
 
-def train_epoch(model, optimizer, lr_scheduler, dataiter, accumulate_step):
+def train_epoch(model, optimizer, lr_scheduler, dataiter, accumulate_step, step, alpha):
     model.train()
     sample_num = 0
     cum_loss = 0
-    step = 0
     for inputs, starts, ends, _, _, _ in tqdm(dataiter):
         step += 1
-        sample_num += inputs.shape[0]
+
+        if step < alpha[0]:
+            alpha_t = 0.0
+        elif step >= alpha[1]:
+            alpha_t = 3.0
+        else:
+            alpha_t = (step - alpha[0]) / (alpha[1]-alpha[0]) * 3.0
+
+        bsz, slen = inputs.shape
+        sample_num += bsz
+        pseudo_mask = (starts == 0).long()
+
+        if pseudo_mask.sum() > 0 and alpha_t > .0:
+            with torch.no_grad():
+                p = model(inputs, attention_mask=(inputs != pad_token_id).long()).max(-1)[1]
+                p_start = (p // slen).long()
+                p_end = (p % slen).long()
+                starts = (1-pseudo_mask)*starts + pseudo_mask*p_start
+                ends = (1-pseudo_mask)*ends+pseudo_mask*p_end
         loss = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long(), start_positions=starts, end_positions=ends)
+        coefs = 1.0 - pseudo_mask.float() + alpha_t * pseudo_mask.float()
+        loss = coefs * loss
         cum_loss += loss.sum().detach().cpu().data.numpy()
         loss.mean().backward()
         # cum_loss += loss.detach().cpu().data.numpy()
@@ -71,7 +117,7 @@ def train_epoch(model, optimizer, lr_scheduler, dataiter, accumulate_step):
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-    return cum_loss/sample_num
+    return cum_loss/sample_num, step
     # return cum_loss/step
 
 
@@ -131,8 +177,9 @@ def deepcopy_state_dict_to_cpu(model):
 def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_dataiter, accumulate_step):
     best_score = float('-inf')
     best_model = deepcopy_state_dict_to_cpu(model)
+    step = 0
     for e in range(epoch):
-        loss = train_epoch(model, optimizer, lr_scheduler, train_dataiter, accumulate_step)
+        loss, step = train_epoch(model, optimizer, lr_scheduler, train_dataiter, accumulate_step, step, (2000, 4000))
         score = validate_epoch(model, val_dataiter)
         print(f'epoch {e} loss {loss:.6f} score: {score:.6f}')
         if score > best_score:
@@ -309,20 +356,20 @@ def lr_decay_adamw(model, rank_layers, no_weight_decay_layers, lr, decay_rate=0.
 def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, lr_decay_rate, beta1, beta2, model_type):
     seed_everything(seed)
     data = joblib.load(data)
+    train_data = data['train']
+    test_data = data['test']
     best_models = []
     best_scores = []
     k = 0
-    for train_idx, val_idx in KFold(n_splits=5, random_state=9895).split(data):  # StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
+    for train_idx, val_idx in KFold(n_splits=5, random_state=9895).split(train_data):  # StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
         k += 1
-        # if k in [1, 3]:
-        #     continue
         print(f'---- {k} Fold ---')
-        # train = [data[i] for i in train_idx if data[i]['sentiment'] != neutral_token_id]
-        # train = [data[i] for i in train_idx if not data[i]['bad']]
-        # train = [data[i] for i in train_idx if data[i]['score'] > 0.5 and data[i]['sentiment'] != neutral_token_id]
-        # train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
-        train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
-        val = [data[i] for i in val_idx]
+        # train = [train_data[i] for i in train_idx if train_data[i]['sentiment'] != neutral_token_id]
+        # train = [train_data[i] for i in train_idx if not train_data[i]['bad']]
+        # train = [train_data[i] for i in train_idx if train_data[i]['score'] > 0.1 and train_data[i]['sentiment'] != neutral_token_id] + test_data
+        # train = [train_data[i] for i in train_idx if train_data[i]['score'] > 0.5]
+        train = [train_data[i] for i in train_idx if train_data[i]['score'] > 0.1] + test_data
+        val = [train_data[i] for i in val_idx]
         print(f"val best score is {np.mean([i['score'] for i in val])}")
         if model_type == 'c':
             model = TweetSentiment_C.from_pretrained(pretrained).cuda()
@@ -338,8 +385,9 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, lr_deca
         optimizer = lr_decay_adamw(model, rank_layers=layers_group, no_weight_decay_layers=no_decay,
                                        decay_rate=lr_decay_rate, lr=lr, eps=1e-6, weight_decay=1e-2, betas=(beta1, beta2))
         train_steps = np.ceil(len(train) / batch_size / accumulate_step * epoch)
+        # lr_scheduler = get_constant_schedule(optimizer)
         lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1*train_steps, num_training_steps=train_steps)
-        trainiter = DataLoader(train, batch_size=batch_size, shuffle=True, collate_fn=collect_func)
+        trainiter = DataLoader(train, batch_size=batch_size, shuffle=True, collate_fn=collect_func0)
         valiter = DataLoader(val, batch_size=batch_size*2, shuffle=False, collate_fn=collect_func)
         best_score, best_model = fold_train(model, optimizer, lr_scheduler, epoch, trainiter, valiter, accumulate_step)
         best_scores.append(best_score)
