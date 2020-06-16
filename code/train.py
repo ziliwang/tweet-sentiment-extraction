@@ -6,6 +6,8 @@ from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from torch.nn.utils import clip_grad_norm_
 from sklearn.model_selection import train_test_split, KFold, StratifiedKFold
+from tokenizers import ByteLevelBPETokenizer
+import pandas as pd
 import joblib
 import click
 import random
@@ -82,41 +84,51 @@ def jaccard(str1, str2):
     return float(len(c)) / (len(a) + len(b) - len(c))
 
 
+def jem(probs, texts):
+    best_score = -999
+    best_text = texts[0]
+    best_idx = 0
+    for i, text1 in enumerate(texts):
+        score = sum([prob*jaccard(text1, text2) for prob, text2 in zip(probs, texts)])
+        if score > best_score:
+            best_text = text1
+            best_score = score
+            best_idx = i
+    return best_text, best_idx
+
+
 def validate_epoch(model, dataiter):
     model.eval()
     score = 0
     sample_counts = 0
     with torch.no_grad():
         for inputs, _, _, offsets, texts, gts in dataiter:
+            bsz, slen = inputs.shape
             span_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
-            span = span_logits.max(-1)[1].cpu().numpy()  # b x idx
-            # probs, spans = torch.topk(span_logits.softmax(-1), k=2, dim=-1)
-            # spans = spans.cpu().numpy()
+            # span_probs = span_logits.softmax(-1).view(bsz, slen, slen)
+            # span_probs = torch.avg_pool1d(span_probs, kernel_size=5, stride=1, padding=2, count_include_pad=False)
+            # span_probs = span_probs.view(bsz, -1)
+            # span = span_logits.max(-1)[1].cpu().numpy()  # b x idx
+            # probs, spans = torch.topk(span_probs, k=2, dim=-1)
+            probs, spans = torch.topk(span_logits.softmax(-1), k=6)
+            probs = probs.cpu().numpy()
+            spans = spans.cpu().numpy()
             bsz, slen = inputs.shape
             sample_counts += bsz
-            # for i in range(bsz):
-            #     if inputs[i][1] == neutral_token_id or len(texts[i].split()) == 1:
-            #         predict = [(texts[i], 1.0)]
-            #     else:
-            #         predict = []
-            #         for j in range(2):
-            #             try:
-            #                 start, end = divmod(spans[i][j], slen)
-            #                 predict.append((texts[i][offsets[i][start-3][0]: offsets[i][end-3][1]], probs[i][j]))
-            #             except IndexError:
-            #                 # predict = texts[i]
-            #                 print(span_logits[i], inputs[i], offsets[i], start, end)
-            #     if len(predict) == 2 and predict[0][1] / predict[1][1] < 1.05:
-            #         predict[0] = (predict[0][0] + ' ' + predict[1][0], 1.0)
-                # if jaccard(gts[i], predict[0][0]) < 0.5 and len(predict) > 1:
-                #     print(f'gt: {gts[i]}\np1: {predict[0]} p2: {predict[1]}')
-                # score += jaccard(gts[i], predict[0][0])
-            for gt, p, text, offset, inp in zip(gts, span, texts, offsets, inputs):
+            for gt, ps, pbs, text, offset, inp in zip(gts, spans, probs, texts, offsets, inputs):
                 predict = text
                 if inp[1] != neutral_token_id:
-                    start, end = divmod(p, slen)
-                    if start -3 >= 0 and start -3 < len(offset) and end -3 >= 0 and end - 3 < len(offset):
-                        predict = text[offset[start-3][0]: offset[end-3][1]]
+                    texts_ = []
+                    probs_ = []
+                    for i, p in enumerate(ps):
+                        start, end = divmod(p, slen)
+                        if start -3 >= 0 and start -3 < len(offset) and end -3 >= 0 and end - 3 < len(offset):
+                            predict_ = text[offset[start-3][0]: offset[end-3][1]]
+                            if len(predict_.split()) == 0:
+                                continue
+                            texts_.append(predict_)
+                            probs_.append(pbs[i])
+                    predict, _ = jem(probs_, texts_)
                 score += jaccard(gt, predict)
     return score/sample_counts
 
@@ -141,51 +153,50 @@ def fold_train(model, optimizer, lr_scheduler, epoch, train_dataiter, val_datait
     return best_score, best_model
 
 
-def loose_dist(start, end, slen, alpha=0.3, threshold=1e-6, min_size=2):
-    start_loose = torch.zeros(slen)
-    end_loose = torch.zeros(slen)
-    start_loose[start] = 1
-    end_loose[end] = 1
-    # w = (end -start + 1).cpu().numpy()
-    for i in range(1, max(min_size, end-start+1)):
-        p = alpha**i
-        # p = np.exp(-i)
-        if p < threshold:
-            break
-        if start + i < slen:
-            start_loose[start+i] = p
-        if end - i >= 0:
-            end_loose[end-i] = p
-        if start-i >= 0:
-            start_loose[start-i] = p  # 0.8*p
-        if end + i < slen:
-            end_loose[end+i] = p  # 0.8*p
-    return start_loose, end_loose
+def test_preprocess(tokenizer, df):
+    output = []
+    sentiment_hash = dict((v[1:], tokenizer.token_to_id(v)) for v in ('Ġpositive', 'Ġnegative', 'Ġneutral'))
+    for line, row in df.iterrows():
+        if pd.isna(row.text): continue
+        text = row.text
+        if not text.startswith(' '): text = ' ' + text
+        record = {}
+        encoding = tokenizer.encode(text.replace('`', "'").replace('ï¿½', '$$$').replace('Â¡', '--'))
+        # c_text = text.replace('`', "'").replace("ï¿½", "$$$").replace('\xc2\xa0', u'  ').replace('Â´', " '")
+        record['tokens_id'] = encoding.ids
+        record['sentiment'] = sentiment_hash[row.sentiment]
+        record['offsets'] = encoding.offsets
+        record['text'] = text
+        record['gt'] = ''
+        record['id'] = row.textID
+        output.append(record)
+    return output
 
 
-def loss_func(predicts, start_positions, end_positions, position_mask):
-    bsz, slen = position_mask.shape
-    start_dist = []
-    end_dist = []
-    for i, start in enumerate(start_positions):
-        sd, ed = loose_dist(start, end_positions[i], slen)
-        start_dist.append(sd)
-        end_dist.append(ed)
-    start_dist = torch.stack(start_dist)
-    end_dist = torch.stack(end_dist)
-    if predicts.is_cuda:
-        start_dist = start_dist.cuda()
-        end_dist = end_dist.cuda()
-    start_dist = start_dist*position_mask
-    end_dist = end_dist*position_mask
-    dist = start_dist[:, :, None].expand(-1, -1, slen) * end_dist[:, None, :].expand(-1, slen, -1)
-    dist = torch.triu(dist)
-    dist = dist.view(bsz, -1)
-    # dist = dist.view(bsz, -1) + 1e-6
-    predicts = predicts + 1e-6
-    # return (dist*(dist/predicts).log()).sum(-1)
-    return -(dist*predicts.log()).sum(-1)
-    # return F.kl_div((predicts+1e-6).log(), (dist+1e-6), reduction='batchmean')
+def collect_test_func(records):
+    ids = []
+    inputs = []
+    offsets = []
+    texts = []
+    for rec in records:
+        ids.append(rec['id'])
+        inputs.append(torch.LongTensor([cls_token_id, rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
+        offsets.append(rec['offsets'])
+        texts.append(rec['text'])
+    return ids, pad_sequence(inputs, batch_first=True, padding_value=pad_token_id).cuda(), offsets, texts
+
+
+def pridect_epoch(model, dataiter, span_logits_bagging):
+    model.eval()
+    with torch.no_grad():
+        for ids, inputs, _, _ in dataiter:
+            span_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
+            span_probs = span_logits.softmax(-1)
+            for i, v in zip(ids, span_probs):
+                if i in span_logits_bagging:
+                    span_logits_bagging[i] += v
+                else:
+                    span_logits_bagging[i] = v
 
 
 class TaskLayer(nn.Module):
@@ -274,7 +285,7 @@ class TweetSentiment_C(BertPreTrainedModel):
         # start_logits, end_logits = self.task2(x).split(1, dim=-1)
         p_mask = attention_mask.float() * (input_ids != sep_token_id).float()
         p_mask[:, :2] = 0
-        span_logits = self.task1(self.dropout(x), attention_mask=p_mask)  # b x slen*slen
+        span_logits, _ = self.task1(self.dropout(x), attention_mask=p_mask)  # b x slen*slen
         if start_positions is not None and end_positions is not None:
             span = start_positions * slen + end_positions
             loss = F.cross_entropy(span_logits, span, reduction='none')
@@ -305,8 +316,58 @@ def lr_decay_adamw(model, rank_layers, no_weight_decay_layers, lr, decay_rate=0.
 @click.option('--lr-decay-rate', default=1.0)
 @click.option('--beta1', default=0.9)
 @click.option('--beta2', default=0.98)
+@click.option('--pesudo', default='none')
 @click.option('--model-type', default='default')
-def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, lr_decay_rate, beta1, beta2, model_type):
+def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, lr_decay_rate, beta1, beta2, pesudo, model_type):
+    if pesudo != 'none':
+        tokenizer = ByteLevelBPETokenizer(os.path.join(pretrained, 'vocab.json'), os.path.join(pretrained, 'merges.txt'),
+                                          lowercase=True, add_prefix_space=True)
+        test_df = pd.read_csv('../input/test.csv')
+        test = test_preprocess(tokenizer, test_df)
+        model_config = RobertaConfig.from_json_file(os.path.join(pretrained, 'config.json'))
+        saved_models = torch.load(pesudo)
+        if saved_models['type'] == 'c':
+            model = TweetSentiment_C(model_config).cuda()
+        else:
+            model = TweetSentiment(model_config).cuda()
+        testiter = DataLoader(test, batch_size=32, shuffle=False, collate_fn=collect_test_func)
+        print(f"5cv {saved_models['score']}")
+        span_logits_bagging = {}
+        for state_dict in saved_models['models']:
+            model.load_state_dict(state_dict)
+            pridect_epoch(model, testiter, span_logits_bagging)
+        id2sentiment = dict((r.textID, r.sentiment) for _, r in test_df.iterrows())
+        pesudo_label = {}
+        for ids, inputs, offsets, texts in testiter:
+            bsz, slen = inputs.shape
+            for id, offset, text in zip(ids, offsets, texts):
+                if id2sentiment[id] == 'neutral':
+                    pesudo_label[id] = (0, len(offset)-1)
+                    continue
+                texts_ = []
+                probs_ = []
+                spans_ = []
+                pbs, ps = torch.topk(span_logits_bagging[id]/5, k=6)
+                pbs = pbs.cpu().numpy()
+                ps = ps.cpu().numpy()
+                for i, p in enumerate(ps):
+                    start, end = divmod(p, slen)
+                    if start -3 >= 0 and start -3 < len(offset) and end -3 >= 0 and end - 3 < len(offset):
+                        predict_ = text[offset[start-3][0]: offset[end-3][1]]
+                        if len(predict_.split()) == 0:
+                            continue
+                        texts_.append(predict_)
+                        probs_.append(pbs[i])
+                        spans_.append((start, end))
+                predict, best_idx = jem(probs_, texts_)
+                start, end = spans_[best_idx]
+                pesudo_label[id] = (start-3, end-3)
+        for i, item in enumerate(test):
+            item['start'] = pesudo_label[item['id']][0]
+            item['end'] = pesudo_label[item['id']][1]
+            assert item['start'] >= 0
+            assert item['start'] <= item['end']
+            assert item['end'] < len(item['offsets']), item
     seed_everything(seed)
     data = joblib.load(data)
     best_models = []
@@ -322,6 +383,8 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, lr_deca
         # train = [data[i] for i in train_idx if data[i]['score'] > 0.5 and data[i]['sentiment'] != neutral_token_id]
         # train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
         train = [data[i] for i in train_idx if data[i]['score'] > 0.5]
+        if pesudo != 'none':
+            train += test
         val = [data[i] for i in val_idx]
         print(f"val best score is {np.mean([i['score'] for i in val])}")
         if model_type == 'c':
@@ -336,7 +399,7 @@ def main(data, pretrained, lr, batch_size, epoch, accumulate_step, seed, lr_deca
         # optimizer = AdamW(model.parameters(), weight_decay=1e-2, lr=lr, eps=1e-6)
         layers_group = ['roberta.embeddings.'] + [f'roberta.encoder.layer.{i}.' for i in range(12)] + ['task.']
         optimizer = lr_decay_adamw(model, rank_layers=layers_group, no_weight_decay_layers=no_decay,
-                                       decay_rate=lr_decay_rate, lr=lr, eps=1e-6, weight_decay=1e-2, betas=(beta1, beta2))
+                                   decay_rate=lr_decay_rate, lr=lr, eps=1e-6, weight_decay=1e-2, betas=(beta1, beta2))
         train_steps = np.ceil(len(train) / batch_size / accumulate_step * epoch)
         lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1*train_steps, num_training_steps=train_steps)
         trainiter = DataLoader(train, batch_size=batch_size, shuffle=True, collate_fn=collect_func)
