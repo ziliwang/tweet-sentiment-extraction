@@ -119,6 +119,7 @@ def pridect_epoch(model, dataiter, span_logits_bagging):
                 else:
                     span_logits_bagging[i] = v
 
+
 @click.command()
 @click.option('--test-path', default='../input/test.csv')
 @click.option('--vocab', default='../model/roberta-l12/vocab.json')
@@ -126,9 +127,10 @@ def pridect_epoch(model, dataiter, span_logits_bagging):
 @click.option('--models', default='trained.models')
 @click.option('--config', default='../model/roberta-l12/config.json')
 def main(test_path, vocab, merges, models, config):
+    moses_token_func = XLMTokenizer(vocab, merges, lowercase=True).moses_tokenize
     tokenizer = ByteLevelBPETokenizer(vocab, merges, lowercase=True, add_prefix_space=True)
     test_df = pd.read_csv(test_path)
-    test = preprocess(tokenizer, test_df)
+    test = preprocess(tokenizer, moses_token_func, test_df)
     model_config = RobertaConfig.from_json_file(config)
     saved_models = torch.load(models)
     model = TweetSentiment(model_config).cuda()
@@ -139,26 +141,18 @@ def main(test_path, vocab, merges, models, config):
         model.load_state_dict(state_dict)
         pridect_epoch(model, testiter, span_logits_bagging)
     id2sentiment = dict((r.textID, r.sentiment) for _, r in test_df.iterrows())
-    predicts = {}
+    starts = []
+    ends = []
     for ids, inputs, offsets, texts in testiter:
         bsz, slen = inputs.shape
         for id, offset, text in zip(ids, offsets, texts):
-            # if id2sentiment[id] == 'neutral' and len(text.split()) == 1:
-            #     predicts[id] = text
-            #     continue
-            # prob, idxs = torch.topk(span_logits_bagging[id], 2, dim=-1)
-            # if prob[0]/prob[1] < 1.05:
-            #     predict = ''
-            #     for idx in idxs.cpu().numpy():
-            #         start, end = divmod(idx, slen)
-            #         predict += ' ' + text[offset[start-3][0]: offset[end-3][1]]
-            # else:
-            #     start, end = divmod(idxs[0].cpu().numpy(), slen)
-            #     predict = text[offset[start-3][0]: offset[end-3][1]]
+            if id
             span = span_logits_bagging[id].max(-1)[1].cpu().numpy()
             start, end = divmod(span, slen)
-            predicts[id] = text[offset[start-3][0]: offset[end-3][1]]
-            # predicts[id] = predict
+            starts.append(start)
+            ends.append(end)
+    starts = np.concatenate(starts)
+    ends = np.concatenate(ends)
     submit = pd.DataFrame()
     submit['textID'] = test_df['textID']
     submit['selected_text'] = [predicts.get(r.textID, r.text) for _, r in test_df.iterrows()]

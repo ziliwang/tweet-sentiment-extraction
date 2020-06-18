@@ -58,9 +58,7 @@ class TaskLayer(nn.Module):
     def __init__(self, hidden_size):
         super(TaskLayer, self).__init__()
         self.hidden_size = hidden_size
-        # self.query = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size), nn.Tanh(), nn.Linear(self.hidden_size, self.hidden_size))
         self.query = nn.Linear(self.hidden_size, self.hidden_size)
-        # self.key = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size), nn.Tanh(), nn.Linear(self.hidden_size, self.hidden_size))
         self.key = nn.Linear(self.hidden_size, self.hidden_size)
 
     def forward(self, hidden_states, attention_mask=None):
@@ -89,7 +87,6 @@ class TweetSentiment(BertPreTrainedModel):
         self.task = TaskLayer(config.hidden_size)
         self.dropout = nn.Dropout(0.2)
         self.init_weights()
-        # torch.nn.init.normal_(self.logits.weight, std=0.02)
 
     def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
         outputs = self.roberta(input_ids, attention_mask=attention_mask)
@@ -107,6 +104,43 @@ class TweetSentiment(BertPreTrainedModel):
             return span_logits
 
 
+class TweetSentiment_C(BertPreTrainedModel):
+    def __init__(self, config):
+        super(TweetSentiment_C, self).__init__(config)
+        # setattr(config, 'output_hidden_states', True)
+        self.roberta = RobertaModel(config)
+        self.task1 = TaskLayer(128+128+128)
+        # self.task2 = TaskLayer(config.hidden_size)
+        self.dropout = nn.Dropout(0.1)
+        self.conv1 = nn.Conv2d(1, 128, kernel_size=(1, config.hidden_size))
+        self.conv2 = nn.Conv2d(1, 128, kernel_size=(3, config.hidden_size), padding=(1, 0))
+        self.conv3 = nn.Conv2d(1, 128, kernel_size=(5, config.hidden_size), padding=(2, 0))
+        self.layernorm = nn.LayerNorm(256+256+128)
+        self.init_weights()
+        # torch.nn.init.normal_(self.logits.weight, std=0.02)
+
+    def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
+        outputs = self.roberta(input_ids, attention_mask=attention_mask)
+        # hidden_states = torch.cat([outputs[0], outputs[1].unsqueeze(1).expand_as(outputs[0])], dim=-1)
+        hidden_states = outputs[0]
+        bsz, slen, hdz = hidden_states.shape
+        x1 = self.conv1(hidden_states[:, None, :, :]).squeeze(-1).transpose(-1, -2)
+        x2 = self.conv2(hidden_states[:, None, :, :]).squeeze(-1).transpose(-1, -2)
+        x3 = self.conv3(hidden_states[:, None, :, :]).squeeze(-1).transpose(-1, -2)
+        x = torch.cat([x1, x2, x3], dim=-1)
+        # start_logits, end_logits = self.task2(x).split(1, dim=-1)
+        p_mask = attention_mask.float() * (input_ids != sep_token_id).float()
+        p_mask[:, :2] = 0
+        span_logits = self.task1(self.dropout(x), attention_mask=p_mask)  # b x slen*slen
+        if start_positions is not None and end_positions is not None:
+            span = start_positions * slen + end_positions
+            loss = F.cross_entropy(span_logits, span, reduction='none')
+            # loss = loss_func(span_logits.softmax(-1), start_positions, end_positions, position_mask=p_mask)
+            return loss
+        else:
+            return span_logits
+
+
 def pridect_epoch(model, dataiter, span_logits_bagging):
     model.eval()
     with torch.no_grad():
@@ -118,6 +152,7 @@ def pridect_epoch(model, dataiter, span_logits_bagging):
                     span_logits_bagging[i] += v
                 else:
                     span_logits_bagging[i] = v
+
 
 @click.command()
 @click.option('--test-path', default='../input/test.csv')
@@ -131,11 +166,17 @@ def main(test_path, vocab, merges, models, config):
     test = preprocess(tokenizer, test_df)
     model_config = RobertaConfig.from_json_file(config)
     saved_models = torch.load(models)
-    model = TweetSentiment(model_config).cuda()
     testiter = DataLoader(test, batch_size=32, shuffle=False, collate_fn=collect_func)
     print(f"5cv {saved_models['score']}")
+    print(saved_models['scores'])
+    print(saved_models['types'])
     span_logits_bagging = {}
-    for state_dict in saved_models['models']:
+    for i, state_dict in enumerate(saved_models['models']):
+        print(f"predicting {saved_models['types'][i]} with score {saved_models['scores'][i]}")
+        if saved_models['types'][i] == 'c':
+            model = TweetSentiment_C(model_config).cuda()
+        else:
+            model = TweetSentiment(model_config).cuda()
         model.load_state_dict(state_dict)
         pridect_epoch(model, testiter, span_logits_bagging)
     id2sentiment = dict((r.textID, r.sentiment) for _, r in test_df.iterrows())
@@ -143,22 +184,9 @@ def main(test_path, vocab, merges, models, config):
     for ids, inputs, offsets, texts in testiter:
         bsz, slen = inputs.shape
         for id, offset, text in zip(ids, offsets, texts):
-            # if id2sentiment[id] == 'neutral' and len(text.split()) == 1:
-            #     predicts[id] = text
-            #     continue
-            # prob, idxs = torch.topk(span_logits_bagging[id], 2, dim=-1)
-            # if prob[0]/prob[1] < 1.05:
-            #     predict = ''
-            #     for idx in idxs.cpu().numpy():
-            #         start, end = divmod(idx, slen)
-            #         predict += ' ' + text[offset[start-3][0]: offset[end-3][1]]
-            # else:
-            #     start, end = divmod(idxs[0].cpu().numpy(), slen)
-            #     predict = text[offset[start-3][0]: offset[end-3][1]]
             span = span_logits_bagging[id].max(-1)[1].cpu().numpy()
             start, end = divmod(span, slen)
             predicts[id] = text[offset[start-3][0]: offset[end-3][1]]
-            # predicts[id] = predict
     submit = pd.DataFrame()
     submit['textID'] = test_df['textID']
     submit['selected_text'] = [predicts.get(r.textID, r.text) for _, r in test_df.iterrows()]

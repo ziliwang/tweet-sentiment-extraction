@@ -14,43 +14,95 @@ from tqdm import tqdm
 from copy import deepcopy
 from tokenizers import ByteLevelBPETokenizer
 import pandas as pd
+import re
 
 
 MAX_LEN = 100
 cls_token_id = 0
 pad_token_id = 1
 sep_token_id = 2
+positive_token_id = 1313
+negative_token_id = 2430
+neutral_token_id = 7974
 
 
-def preprocess(tokenizer, df):
-    output = []
-    sentiment_hash = dict((v[1:], tokenizer.token_to_id(v)) for v in ('Ġpositive', 'Ġnegative', 'Ġneutral'))
-    for line, row in df.iterrows():
-        if pd.isna(row.text): continue
-        text = row.text
-        if not text.startswith(' '): text = ' ' + text
-        record = {}
-        encoding = tokenizer.encode(text.replace('`', "'"))
-        record['tokens_id'] = encoding.ids
-        record['sentiment'] = sentiment_hash[row.sentiment]
-        record['offsets'] = encoding.offsets
-        record['text'] = text
-        record['id'] = row.textID
-        output.append(record)
-    return output
+def jaccard(str1, str2):
+    a = set(str1.lower().split())
+    b = set(str2.lower().split())
+    c = a.intersection(b)
+    return float(len(c)) / (len(a) + len(b) - len(c))
+
+
+def jem(probs, texts, k):
+    best_score = -999
+    best_text = texts[0]
+    for text1 in texts:
+        score = sum([prob*jaccard(text1, text2) for prob, text2 in zip(probs, texts)])
+        if score > best_score:
+            best_text = text1
+            best_score = score
+    return best_text
+
+
+def validate_epoch(model, dataiter):
+    model.eval()
+    score = 0
+    sample_counts = 0
+    with torch.no_grad():
+        for inputs, _, _, offsets, texts, gts in dataiter:
+            bsz, slen = inputs.shape
+            span_logits = model(input_ids=inputs, attention_mask=(inputs!=pad_token_id).long())
+            # span_probs = span_logits.softmax(-1).view(bsz, slen, slen)
+            # span_probs = torch.avg_pool1d(span_probs, kernel_size=5, stride=1, padding=2, count_include_pad=False)
+            # span_probs = span_probs.view(bsz, -1)
+            # span = span_logits.max(-1)[1].cpu().numpy()  # b x idx
+            # probs, spans = torch.topk(span_probs, k=2, dim=-1)
+            probs, spans = torch.topk(span_logits.softmax(-1), k=5)
+            probs = probs.cpu().numpy()
+            spans = spans.cpu().numpy()
+            bsz, slen = inputs.shape
+            sample_counts += bsz
+            for gt, ps, pbs, text, offset, inp in zip(gts, spans, probs, texts, offsets, inputs):
+                predict = text
+                if inp[1] != neutral_token_id:
+                    texts_ = []
+                    probs_ = []
+                    for i, p in enumerate(ps):
+                        start, end = divmod(p, slen)
+                        if start -3 >= 0 and start -3 < len(offset) and end -3 >= 0 and end - 3 < len(offset):
+                            predict_ = text[offset[start-3][0]: offset[end-3][1]]
+                            if len(predict_.split()) == 0:
+                                continue
+                            texts_.append(predict_)
+                            probs_.append(pbs[i])
+                    try:
+                        predict = jem(probs_, texts_, text)
+                    except ZeroDivisionError:
+                        print(probs_, texts_)
+                try:
+                    score += jaccard(gt, predict)
+                except ZeroDivisionError as s:
+                    print(s, gt, predict)
+    # print(collections.Counter(gt_s_word), collections.Counter(s_word_pt), collections.Counter(s_word_pn))
+    return score/sample_counts
 
 
 def collect_func(records):
-    ids = []
     inputs = []
+    starts = []
+    ends = []
     offsets = []
     texts = []
+    gts = []
     for rec in records:
-        ids.append(rec['id'])
         inputs.append(torch.LongTensor([cls_token_id, rec['sentiment'], sep_token_id] + rec['tokens_id'][:MAX_LEN] + [sep_token_id]))
+        starts.append(rec['start']+3)
+        ends.append(rec['end']+3)
         offsets.append(rec['offsets'])
         texts.append(rec['text'])
-    return ids, pad_sequence(inputs, batch_first=True, padding_value=pad_token_id).cuda(), offsets, texts
+        gts.append(rec['gt'])
+    return pad_sequence(inputs, batch_first=True, padding_value=pad_token_id).cuda(), torch.LongTensor(starts).cuda(), torch.LongTensor(ends).cuda(), \
+        offsets, texts, gts
 
 
 class TaskLayer(nn.Module):
@@ -119,50 +171,31 @@ def pridect_epoch(model, dataiter, span_logits_bagging):
                 else:
                     span_logits_bagging[i] = v
 
+
 @click.command()
-@click.option('--test-path', default='../input/test.csv')
-@click.option('--vocab', default='../model/roberta-l12/vocab.json')
-@click.option('--merges', default='../model/roberta-l12/merges.txt')
+@click.option('--data', default='roberta.input.joblib')
 @click.option('--models', default='trained.models')
 @click.option('--config', default='../model/roberta-l12/config.json')
-def main(test_path, vocab, merges, models, config):
-    tokenizer = ByteLevelBPETokenizer(vocab, merges, lowercase=True, add_prefix_space=True)
-    test_df = pd.read_csv(test_path)
-    test = preprocess(tokenizer, test_df)
-    model_config = RobertaConfig.from_json_file(config)
-    saved_models = torch.load(models)
-    model = TweetSentiment(model_config).cuda()
-    testiter = DataLoader(test, batch_size=32, shuffle=False, collate_fn=collect_func)
-    print(f"5cv {saved_models['score']}")
-    span_logits_bagging = {}
-    for state_dict in saved_models['models']:
-        model.load_state_dict(state_dict)
-        pridect_epoch(model, testiter, span_logits_bagging)
-    id2sentiment = dict((r.textID, r.sentiment) for _, r in test_df.iterrows())
-    predicts = {}
-    for ids, inputs, offsets, texts in testiter:
-        bsz, slen = inputs.shape
-        for id, offset, text in zip(ids, offsets, texts):
-            # if id2sentiment[id] == 'neutral' and len(text.split()) == 1:
-            #     predicts[id] = text
-            #     continue
-            # prob, idxs = torch.topk(span_logits_bagging[id], 2, dim=-1)
-            # if prob[0]/prob[1] < 1.05:
-            #     predict = ''
-            #     for idx in idxs.cpu().numpy():
-            #         start, end = divmod(idx, slen)
-            #         predict += ' ' + text[offset[start-3][0]: offset[end-3][1]]
-            # else:
-            #     start, end = divmod(idxs[0].cpu().numpy(), slen)
-            #     predict = text[offset[start-3][0]: offset[end-3][1]]
-            span = span_logits_bagging[id].max(-1)[1].cpu().numpy()
-            start, end = divmod(span, slen)
-            predicts[id] = text[offset[start-3][0]: offset[end-3][1]]
-            # predicts[id] = predict
-    submit = pd.DataFrame()
-    submit['textID'] = test_df['textID']
-    submit['selected_text'] = [predicts.get(r.textID, r.text) for _, r in test_df.iterrows()]
-    submit.to_csv("submission.csv", index=False)
+def main(data, models, config):
+    data = joblib.load(data)
+    best_models = torch.load(models)
+    scores = []
+    k = 0
+    for train_idx, val_idx in KFold(n_splits=5, random_state=9895).split(data):  # StratifiedKFold(n_splits=5, random_state=seed).split(data, [i['sentiment'] for i in data]):
+        k += 1
+        # if k in [1, 3]:
+        #     continue
+        print(f'---- {k} Fold ---')
+        model_config = RobertaConfig.from_json_file(config)
+        model = TweetSentiment(model_config).cuda()
+        model.load_state_dict(best_models['models'][k-1])
+        val = [data[i] for i in val_idx]
+        valiter = DataLoader(val, batch_size=32*2, shuffle=False, collate_fn=collect_func)
+        score = validate_epoch(model, valiter)
+        print(f'fold {k} {score}')
+        scores.append(score)
+
+    print(f'mean {np.mean(scores)}')
 
 
 if __name__ == "__main__":
